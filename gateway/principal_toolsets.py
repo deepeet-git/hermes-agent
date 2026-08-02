@@ -111,6 +111,16 @@ def resolve_principal_toolsets(
     channel_rule = channels.get(effective_channel)
     if not isinstance(channel_rule, dict):
         return PrincipalToolsetDecision((), "denied_channel")
+    allowed_user_ids = channel_rule.get("allowed_user_ids")
+    if allowed_user_ids is not None:
+        if (
+            not isinstance(allowed_user_ids, list)
+            or not allowed_user_ids
+            or not all(isinstance(value, str) and value for value in allowed_user_ids)
+        ):
+            return PrincipalToolsetDecision((), "invalid_policy")
+        if user_id not in allowed_user_ids:
+            return PrincipalToolsetDecision((), "denied_principal")
     if user_id in owners and channel_rule.get("owner") == "inherit":
         return PrincipalToolsetDecision(tuple(platform_toolsets), "owner_inherit")
 

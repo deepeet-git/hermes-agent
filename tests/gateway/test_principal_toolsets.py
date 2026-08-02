@@ -25,6 +25,7 @@ def _policy() -> dict:
             "pdp": {
                 "owner": ["terminal", "file", "image_gen", "vision", "deepeet-pdp"],
                 "regular": ["deepeet-pdp"],
+                "allowed_user_ids": ["owner", "regular", "regular-user"],
             },
         },
     }
@@ -113,6 +114,23 @@ def test_regular_user_in_pdp_thread_gets_only_pdp_capability() -> None:
 
     assert decision.toolsets == ("deepeet-pdp",)
     assert decision.reason == "regular_explicit"
+
+
+def test_pdp_channel_denies_user_outside_channel_capability_allowlist() -> None:
+    decision = resolve_principal_toolsets(
+        platform_toolsets=["web", "terminal", "deepeet-pdp"],
+        policy=_policy(),
+        platform="discord",
+        user_id="outsider",
+        scope_id="guild",
+        chat_id="pdp",
+        validated_parent_chat_id=None,
+        is_dm=False,
+        is_valid_toolset=_valid_toolset,
+    )
+
+    assert decision.toolsets == ()
+    assert decision.reason == "denied_principal"
 
 
 def test_owner_in_pdp_channel_gets_only_configured_pdp_workflow_tools() -> None:
