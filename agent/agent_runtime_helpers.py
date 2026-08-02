@@ -2808,6 +2808,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # Defense in depth: model schemas are not an authorization boundary.  A
+    # restricted agent must re-check the assembled surface immediately before
+    # every execution, including agent-loop tools that bypass model_tools.
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    if enabled_toolsets is not None:
+        valid_tool_names = set(getattr(agent, "valid_tool_names", None) or ())
+        if function_name not in valid_tool_names:
+            return json.dumps(
+                {"error": f"'{function_name}' is not available in this session."},
+                ensure_ascii=False,
+            )
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware

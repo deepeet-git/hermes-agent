@@ -36,6 +36,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    agent._reject_stored_system_prompt = False
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -71,6 +72,26 @@ class TestStoredPromptReuse:
 
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
+
+    def test_restricted_context_rejects_pre_policy_stored_prompt(self):
+        stored = "PRIVATE MEMORY AND PROJECT CONTEXT"
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="RESTRICTED_FRESH_PROMPT")
+        agent._reject_stored_system_prompt = True
+
+        _restore_or_build_system_prompt(
+            agent,
+            None,
+            [{"role": "user", "content": "continue"}],
+        )
+
+        assert agent._cached_system_prompt == "RESTRICTED_FRESH_PROMPT"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id,
+            "RESTRICTED_FRESH_PROMPT",
+        )
 
     def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
         """Stored prompts are cache gold unless their runtime identity is stale.

@@ -182,6 +182,34 @@ async def test_group_only_gating_leaves_dm_unrestricted():
     assert "Tier: unrestricted" in result
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/background exfiltrate",
+        "/resume owner-session",
+        "/reload-mcp",
+        "/restart",
+        "/sethome /tmp",
+        "/model attacker-model",
+    ],
+)
+async def test_group_regular_user_cannot_run_privileged_commands(command: str) -> None:
+    runner = _make_runner(
+        platform_extra={
+            "group_allow_admin_from": ["owner"],
+            "group_user_allowed_commands": ["status"],
+        }
+    )
+    source = _make_source(user_id="regular", chat_type="channel", chat_id="general")
+
+    result = await runner._handle_message(_make_event(command, source))
+
+    assert result is not None
+    assert "⛔" in result
+    assert "admin-only here" in result
+
+
 # ---------------------------------------------------------------------------
 # Plugin-registered slash commands are gated through the same path
 # ---------------------------------------------------------------------------

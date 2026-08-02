@@ -1140,6 +1140,48 @@ def handle_function_call(
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
+    # Re-authorize immediately before dispatch. Tool schemas reduce the attack
+    # surface but are not a security boundary: callers can invoke this function
+    # directly, and deferred aliases recurse back into it. An explicit empty
+    # toolset therefore means deny-all, never unrestricted access.
+    if enabled_toolsets is not None:
+        scoped_names = set(enabled_tools or ())
+        if function_name not in scoped_names:
+            try:
+                scoped_defs = get_tool_definitions(
+                    enabled_toolsets=enabled_toolsets,
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                ) or []
+                for definition in scoped_defs:
+                    if not isinstance(definition, dict):
+                        continue
+                    scoped_name = definition.get("name") or (
+                        definition.get("function") or {}
+                    ).get("name")
+                    if isinstance(scoped_name, str):
+                        scoped_names.add(scoped_name)
+                if function_name in {"tool_search", "tool_describe", "tool_call"}:
+                    assembled_defs = get_tool_definitions(
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
+                        quiet_mode=True,
+                    ) or []
+                    for definition in assembled_defs:
+                        if not isinstance(definition, dict):
+                            continue
+                        scoped_name = definition.get("name") or (
+                            definition.get("function") or {}
+                        ).get("name")
+                        if isinstance(scoped_name, str):
+                            scoped_names.add(scoped_name)
+            except Exception as exc:
+                logger.warning("Scoped tool authorization failed closed: %s", exc)
+                scoped_names = set()
+            if function_name not in scoped_names:
+                return tool_error(f"'{function_name}' is not available in this session.")
+
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
