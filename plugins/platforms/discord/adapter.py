@@ -5994,6 +5994,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Get channel topic (if available).
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
+        guild = getattr(interaction, "guild", None) or getattr(interaction.channel, "guild", None)
+        parent_id = str(getattr(interaction.channel, "parent_id", "") or "") or None
+        if is_thread and parent_id is None:
+            parent_id = str(getattr(getattr(interaction.channel, "parent", None), "id", "") or "") or None
 
         source = self.build_source(
             chat_id=str(interaction.channel_id),
@@ -6003,7 +6007,16 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            is_bot=bool(getattr(interaction.user, "bot", False)),
+            guild_id=str(getattr(guild, "id", "") or "") or None,
+            parent_chat_id=parent_id,
+            message_id=str(getattr(interaction, "id", "") or "") or None,
         )
+        # Authorization provenance: only the live Discord adapter stamps this
+        # non-serialized value after deriving it from discord.py's channel
+        # object. Gateway policy must never authorize a thread from the
+        # serializable parent_chat_id field alone.
+        setattr(source, "_validated_parent_chat_id", parent_id if is_thread else None)
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
@@ -6089,6 +6102,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
 
+        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
+        _parent_id = str(getattr(_parent_channel, "id", "") or "")
+        guild = getattr(interaction, "guild", None)
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
@@ -6097,10 +6113,13 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            is_bot=bool(getattr(interaction.user, "bot", False)),
+            guild_id=str(getattr(guild, "id", "") or "") or None,
+            parent_chat_id=_parent_id or None,
+            message_id=str(getattr(interaction, "id", "") or "") or None,
         )
+        setattr(source, "_validated_parent_chat_id", _parent_id or None)
 
-        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-        _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(
@@ -7862,7 +7881,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             chat_topic=chat_topic,
             is_bot=getattr(message.author, "bot", False),
-            guild_id=str(guild.id) if guild else None,
+            guild_id=str(getattr(guild, "id", "") or "") or None,
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
             role_authorized=role_authorized,
@@ -7871,6 +7890,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 getattr(auto_threaded_channel, "_hermes_auto_thread_initial_name", None)
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
+        )
+        setattr(
+            source,
+            "_validated_parent_chat_id",
+            parent_channel_id if is_thread else None,
         )
 
         # Build media URLs -- download image attachments to local cache so the

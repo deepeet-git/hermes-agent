@@ -521,6 +521,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 agent.session_id, exc,
             )
 
+    if stored_prompt and getattr(agent, "_reject_stored_system_prompt", False):
+        # Principal-scoped gateway turns must not inherit a prompt snapshot
+        # created before the authorization ceiling existed. Such snapshots can
+        # contain MEMORY.md, USER.md, SOUL.md, project context, or provider
+        # memory blocks that are intentionally absent from restricted agents.
+        stored_state = "restricted_context"
+        stored_prompt = None
+
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.

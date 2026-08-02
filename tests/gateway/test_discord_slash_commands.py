@@ -355,8 +355,9 @@ async def test_handle_thread_create_slash_falls_back_to_seed_message(adapter):
 async def test_dispatch_thread_session_builds_thread_event(adapter):
     """Dispatched event should have chat_type=thread and chat_id=thread_id."""
     interaction = SimpleNamespace(
-        user=SimpleNamespace(display_name="Jezza", id=42),
-        guild=SimpleNamespace(name="TestGuild"),
+        user=SimpleNamespace(display_name="Jezza", id=42, bot=False),
+        guild=SimpleNamespace(name="TestGuild", id=1),
+        channel=_FakeTextChannel(channel_id=100),
     )
 
     captured_events = []
@@ -374,6 +375,9 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
+    assert event.source.scope_id == "1"
+    assert event.source.parent_chat_id == "100"
+    assert getattr(event.source, "_validated_parent_chat_id", None) == "100"
     assert "TestGuild" in event.source.chat_name
 
 
@@ -395,6 +399,10 @@ def test_build_slash_event_preserves_thread_context(adapter):
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
+    assert event.source.scope_id == "1"
+    assert event.source.parent_chat_id == "100"
+    assert getattr(event.source, "_validated_parent_chat_id", None) == "100"
+    assert event.source.is_bot is False
     assert "TestGuild" in event.source.chat_name
 
 

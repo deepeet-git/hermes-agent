@@ -3204,6 +3204,130 @@ def _load_gateway_config() -> dict:
     return raw
 
 
+def _resolve_principal_enabled_toolsets(
+    *,
+    user_config: dict,
+    source: SessionSource,
+    platform_toolsets: list[str],
+) -> list[str]:
+    """Clamp platform toolsets using trusted gateway source metadata.
+
+    The feature is intentionally opt-in through an environment flag so a
+    single launchd/.env change is a complete rollback.  Once enabled for
+    Discord, a missing or malformed policy returns an empty list rather than
+    falling back to the platform-wide toolset.
+    """
+
+    from gateway.principal_toolsets import apply_principal_toolset_policy
+    from toolsets import validate_toolset
+
+    discord_config = user_config.get("discord") if isinstance(user_config, dict) else None
+    policy_present = (
+        isinstance(discord_config, dict)
+        and "principal_toolsets" in discord_config
+    )
+    policy = (
+        discord_config.get("principal_toolsets")
+        if isinstance(discord_config, dict)
+        else None
+    )
+    feature_raw = os.environ.get(
+        "HERMES_DISCORD_PRINCIPAL_TOOLSETS_ENABLED", ""
+    ).strip().lower()
+    if feature_raw:
+        # Only explicit false values disable the ceiling. Typos and unknown
+        # non-empty values stay fail-closed instead of silently restoring all
+        # Discord tools.
+        feature_enabled = feature_raw not in {"0", "false", "no", "off"}
+    else:
+        # Once a policy exists, a missing environment variable must not turn
+        # authorization off. The env flag remains an explicit rollback switch.
+        feature_enabled = policy_present
+    platform_key = _platform_config_key(source.platform)
+    validated_parent_chat_id = None
+    if feature_enabled:
+        # Relay payloads do not currently carry an authenticated underlying
+        # Discord principal. Never interpret serialized relay metadata as
+        # native Discord authority.
+        if platform_key == "relay":
+            logger.warning("Principal toolset policy denied unnormalized relay source")
+            return []
+        if platform_key == "discord":
+            # Native adapters stamp an in-process weak reference on
+            # SessionSource. That marker is deliberately omitted from
+            # serialization, so replayed/API-constructed source fields cannot
+            # gain principal authority.
+            adapter_ref = getattr(source, "_transport_adapter_ref", None)
+            try:
+                transport_adapter = adapter_ref() if callable(adapter_ref) else None
+            except Exception:
+                transport_adapter = None
+            trusted_native_source = (
+                transport_adapter is not None
+                and getattr(transport_adapter, "platform", None) == Platform.DISCORD
+                and not source.delivered_via_upstream_relay
+            )
+            validated_parent_chat_id = getattr(
+                source, "_validated_parent_chat_id", None
+            )
+            if source.chat_type == "thread":
+                trusted_native_source = trusted_native_source and bool(
+                    source.thread_id
+                    and validated_parent_chat_id
+                    and source.parent_chat_id == validated_parent_chat_id
+                )
+            elif source.thread_id or validated_parent_chat_id:
+                trusted_native_source = False
+            if not trusted_native_source:
+                logger.warning("Principal toolset policy denied unverified Discord source")
+                return []
+
+    decision = apply_principal_toolset_policy(
+        feature_enabled=feature_enabled,
+        platform_toolsets=platform_toolsets,
+        policy=policy,
+        platform=platform_key,
+        user_id=source.user_id,
+        scope_id=source.scope_id,
+        chat_id=source.chat_id,
+        validated_parent_chat_id=validated_parent_chat_id,
+        is_dm=source.chat_type == "dm",
+        is_valid_toolset=validate_toolset,
+        is_bot=source.is_bot,
+    )
+    if decision.toolsets is None:
+        return sorted(platform_toolsets)
+
+    effective_channel = validated_parent_chat_id or source.chat_id
+    logger.info(
+        "Principal toolset decision platform=%s channel=%s reason=%s toolsets=%s",
+        platform_key,
+        effective_channel,
+        decision.reason,
+        ",".join(decision.toolsets) or "none",
+    )
+    return sorted(decision.toolsets)
+
+
+def _principal_context_is_restricted(
+    *,
+    source: SessionSource,
+    platform_toolsets: list[str],
+    enabled_toolsets: list[str],
+) -> bool:
+    """Return whether private memory/project context must be suppressed.
+
+    A principal-scoped Discord or unnormalized relay turn gets only the tools
+    in its authorization ceiling and must not inherit MEMORY.md, USER.md,
+    external memory providers, SOUL.md, or project context files. Owner turns
+    that inherit the complete Discord platform toolset retain existing context.
+    """
+
+    if source.platform not in {Platform.DISCORD, Platform.RELAY}:
+        return False
+    return sorted(enabled_toolsets) != sorted(platform_toolsets)
+
+
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
     """Translate gateway checkpoint config into ``AIAgent`` constructor args.
 
@@ -4800,6 +4924,8 @@ class TurnRunner:
                 verbose_logging=False,
                 enabled_toolsets=ctx.enabled_toolsets,
                 disabled_toolsets=ctx.disabled_toolsets,
+                skip_memory=ctx.restrict_private_context,
+                skip_context_files=ctx.restrict_private_context,
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
@@ -4829,6 +4955,7 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            agent._reject_stored_system_prompt = ctx.restrict_private_context
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     # Record the session_id the snapshot was taken for
@@ -16898,7 +17025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     max_iterations=4,
                                     quiet_mode=True,
                                     skip_memory=True,
-                                    enabled_toolsets=["memory"],
+                                    enabled_toolsets=[],
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
                                 )
@@ -19518,7 +19645,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            platform_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _resolve_principal_enabled_toolsets(
+                user_config=user_config,
+                source=source,
+                platform_toolsets=platform_toolsets,
+            )
+            restrict_private_context = _principal_context_is_restricted(
+                source=source,
+                platform_toolsets=platform_toolsets,
+                enabled_toolsets=enabled_toolsets,
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -19558,6 +19695,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+                    skip_memory=restrict_private_context,
+                    skip_context_files=restrict_private_context,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -19580,6 +19719,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                agent._reject_stored_system_prompt = restrict_private_context
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -24291,18 +24431,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
-        # ---- Proxy mode: delegate to remote API server ----
-        if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
-                message=message,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=event_message_id,
-            )
+        # ---- Proxy mode is resolved after the principal toolset ceiling. ----
 
         from run_agent import AIAgent
         import queue
@@ -24316,7 +24445,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        platform_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = _resolve_principal_enabled_toolsets(
+            user_config=user_config,
+            source=source,
+            platform_toolsets=platform_toolsets,
+        )
+        restrict_private_context = _principal_context_is_restricted(
+            source=source,
+            platform_toolsets=platform_toolsets,
+            enabled_toolsets=enabled_toolsets,
+        )
+        if self._get_proxy_url():
+            if restrict_private_context:
+                return {
+                    "final_response": "이 채널의 제한된 권한은 원격 프록시에서 안전하게 실행할 수 없습니다.",
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                }
+            return await self._run_agent_via_proxy(
+                message=message,
+                context_prompt=context_prompt,
+                history=history,
+                source=source,
+                session_id=session_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                event_message_id=event_message_id,
+            )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -24545,6 +24702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_config=user_config,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            restrict_private_context=restrict_private_context,
             log_mode_enabled=log_mode_enabled,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             needs_progress_queue=needs_progress_queue,

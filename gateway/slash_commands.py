@@ -4122,7 +4122,7 @@ class GatewaySlashCommandsMixin:
                 max_iterations=4,
                 quiet_mode=True,
                 skip_memory=True,
-                enabled_toolsets=["memory"],
+                enabled_toolsets=[],
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
             )
