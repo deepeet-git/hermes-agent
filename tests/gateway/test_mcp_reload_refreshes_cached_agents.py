@@ -174,3 +174,30 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
     assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_preserves_explicit_deny_all_toolset() -> None:
+    runner = _make_runner_with_cached_agents(num_agents=1)
+    agent, _sig = runner._agent_cache["session-0"]
+    agent.enabled_toolsets = []
+    agent.disabled_toolsets = None
+
+    captured_calls = []
+
+    def _capture_get_tool_definitions(**kwargs):
+        captured_calls.append(kwargs)
+        return []
+
+    with (
+        patch("tools.mcp_tool.shutdown_mcp_servers"),
+        patch("tools.mcp_tool.discover_mcp_tools", return_value=[]),
+        patch.dict("tools.mcp_tool._servers", {}, clear=True),
+        patch("model_tools.get_tool_definitions", side_effect=_capture_get_tool_definitions),
+    ):
+        await runner._execute_mcp_reload(_make_event())
+
+    assert captured_calls
+    assert captured_calls[0]["enabled_toolsets"] == []
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()

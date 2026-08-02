@@ -259,6 +259,7 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     # Stable gateway session key preserved, identical to a normal gateway turn.
     assert kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
     assert kwargs["gateway_session_key"]
+    assert kwargs["enabled_toolsets"] == []
 
 
 @pytest.mark.asyncio

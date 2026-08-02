@@ -143,6 +143,8 @@ class TestRunBackgroundTask:
         }
         with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
              patch("gateway.run._load_gateway_config", return_value=checkpoint_config), \
+             patch("gateway.run._resolve_principal_enabled_toolsets", return_value=["web"]) as resolve_scoped, \
+             patch("gateway.run._principal_context_is_restricted", return_value=True) as restrict_context, \
              patch("run_agent.AIAgent") as MockAgent:
             mock_agent_instance = MagicMock()
             mock_agent_instance.shutdown_memory_provider = MagicMock()
@@ -163,6 +165,12 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_snapshots"] == 8
         assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
+        assert agent_kwargs["enabled_toolsets"] == ["web"]
+        assert agent_kwargs["skip_memory"] is True
+        assert agent_kwargs["skip_context_files"] is True
+        resolve_scoped.assert_called_once()
+        restrict_context.assert_called_once()
+        assert resolve_scoped.call_args.kwargs["source"] is source
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
