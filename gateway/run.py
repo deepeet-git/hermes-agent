@@ -19646,11 +19646,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             from hermes_cli.tools_config import _get_platform_tools
             platform_toolsets = sorted(_get_platform_tools(user_config, platform_key))
-            enabled_toolsets = _resolve_principal_enabled_toolsets(
+            policy_toolsets = _resolve_principal_enabled_toolsets(
                 user_config=user_config,
                 source=source,
                 platform_toolsets=platform_toolsets,
             )
+            authorized_toolsets = set(
+                self._principal_effective_toolsets(source, platform_toolsets)
+            )
+            enabled_toolsets = [
+                name for name in policy_toolsets if name in authorized_toolsets
+            ]
             restrict_private_context = _principal_context_is_restricted(
                 source=source,
                 platform_toolsets=platform_toolsets,
@@ -24446,20 +24452,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.tools_config import _get_platform_tools
         platform_toolsets = sorted(_get_platform_tools(user_config, platform_key))
-        enabled_toolsets = _resolve_principal_enabled_toolsets(
+        policy_toolsets = _resolve_principal_enabled_toolsets(
             user_config=user_config,
             source=source,
             platform_toolsets=platform_toolsets,
         )
+        authorized_toolsets = set(
+            self._principal_effective_toolsets(source, platform_toolsets)
+        )
+        enabled_toolsets = [
+            name for name in policy_toolsets if name in authorized_toolsets
+        ]
         restrict_private_context = _principal_context_is_restricted(
             source=source,
             platform_toolsets=platform_toolsets,
             enabled_toolsets=enabled_toolsets,
         )
         if self._get_proxy_url():
-            if restrict_private_context:
+            if self._principal_policy_blocks_proxy(source):
                 return {
-                    "final_response": "이 채널의 제한된 권한은 원격 프록시에서 안전하게 실행할 수 없습니다.",
+                    "final_response": (
+                        "⚠️ Proxy mode is disabled for Discord sources governed "
+                        "by principal_toolsets because the remote agent cannot "
+                        "enforce the local channel capability policy."
+                    ),
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
