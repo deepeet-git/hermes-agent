@@ -180,6 +180,23 @@ def test_principal_policy_requires_nonempty_scope_ids(monkeypatch):
         ) == []
 
 
+def test_principal_policy_rejects_unknown_chat_type(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="pdp-channel",
+        chat_type="mystery",
+        user_id="jhm",
+        scope_id="guild-1",
+    )
+
+    runner = _runner(_policy())
+    assert runner._is_user_authorized(source) is False
+    assert runner._principal_effective_toolsets(
+        source, ["deepeet-pdp", "web"]
+    ) == []
+
+
 def test_discord_regular_principal_receives_only_channel_toolsets():
     source = SessionSource(
         platform=Platform.DISCORD,
