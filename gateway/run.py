@@ -18771,6 +18771,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = self._principal_effective_toolsets(source, enabled_toolsets)
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -23519,6 +23520,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if self._principal_policy_blocks_proxy(source):
+                return {
+                    "final_response": (
+                        "⚠️ Proxy mode is disabled for Discord sources governed "
+                        "by principal_toolsets because the remote agent cannot "
+                        "enforce the local channel capability policy."
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                }
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -23543,6 +23555,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._principal_effective_toolsets(source, enabled_toolsets)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 

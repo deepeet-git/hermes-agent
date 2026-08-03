@@ -6631,6 +6631,32 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
 
+    def verified_parent_chat_id(self, source: Any) -> Optional[str]:
+        """Revalidate a thread parent from Discord's live channel cache."""
+        if not source.parent_chat_id or not source.chat_id:
+            return None
+        client = self._client
+        if client is None or discord is None:
+            return None
+        try:
+            channel = client.get_channel(int(source.chat_id))
+        except (TypeError, ValueError):
+            return None
+        if channel is None or not isinstance(channel, discord.Thread):
+            return None
+
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id is None:
+            parent_id = getattr(getattr(channel, "parent", None), "id", None)
+        if parent_id is None or str(parent_id) != str(source.parent_chat_id):
+            return None
+
+        expected_scope = source.scope_id or source.guild_id
+        actual_scope = getattr(getattr(channel, "guild", None), "id", None)
+        if expected_scope and (actual_scope is None or str(actual_scope) != str(expected_scope)):
+            return None
+        return str(parent_id)
+
     async def _resolve_interaction_channel(self, interaction: discord.Interaction) -> Optional[Any]:
         """Return the interaction channel, fetching it if the payload is partial."""
         channel = getattr(interaction, "channel", None)

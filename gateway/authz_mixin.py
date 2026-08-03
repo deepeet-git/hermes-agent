@@ -90,6 +90,133 @@ def _coerce_allow_set(raw) -> set[str]:
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
+    def _principal_policy_context(self, source: SessionSource):
+        """Return ``(adapter, configured, policy)`` from trusted Gateway config."""
+        adapter = self._authorization_adapter(
+            source.platform,
+            profile=self._adapter_profile_for_source(source),
+        )
+        configs = [getattr(adapter, "config", None)]
+        platform_cfg = getattr(getattr(self, "config", None), "platforms", {}).get(
+            source.platform
+        )
+        configs.append(platform_cfg)
+        for config in configs:
+            extra = getattr(config, "extra", None)
+            if isinstance(extra, dict) and "principal_toolsets" in extra:
+                return adapter, True, extra.get("principal_toolsets")
+        return adapter, False, None
+
+    def _principal_policy_blocks_proxy(self, source: SessionSource) -> bool:
+        """Fail closed when a remote proxy cannot enforce local principal policy."""
+        if source.platform != Platform.DISCORD:
+            return False
+        _adapter, configured, _policy = self._principal_policy_context(source)
+        return configured
+
+    @staticmethod
+    def _principal_policy_channel_ids(source: SessionSource, adapter) -> list[str]:
+        """Return only channel IDs whose policy may govern this source."""
+        if source.chat_type == "thread" or source.thread_id:
+            verifier = getattr(adapter, "verified_parent_chat_id", None)
+            if callable(verifier):
+                try:
+                    parent_id = verifier(source)
+                except Exception:
+                    return []
+                if parent_id and str(parent_id) == str(source.parent_chat_id):
+                    return [str(parent_id)]
+            return []
+        return [source.chat_id]
+
+    def _principal_effective_toolsets(
+        self,
+        source: SessionSource,
+        platform_toolsets: list[str],
+    ) -> list[str]:
+        """Narrow Discord tools for the trusted principal/channel context.
+
+        An absent policy preserves legacy platform tools. Once configured, a
+        missing, malformed, wrong-scope, or unverifiable channel rule denies all
+        tools. Configured rules may only subtract from platform-enabled toolsets.
+        """
+        default = list(platform_toolsets)
+        if source.platform != Platform.DISCORD:
+            return default
+
+        adapter, configured, policy = self._principal_policy_context(source)
+        if not configured:
+            return default
+        if not isinstance(policy, dict):
+            return []
+
+        scopes = _coerce_allow_set(policy.get("scope_ids"))
+        if not scopes or source.scope_id not in scopes:
+            return []
+
+        owners = _coerce_allow_set(policy.get("owner_user_ids"))
+        tier = "owner" if source.user_id in owners else "regular"
+
+        if source.chat_type == "dm":
+            dm_policy = policy.get("dm")
+            if not isinstance(dm_policy, dict):
+                return []
+            selected = dm_policy.get(tier)
+        else:
+            channels = policy.get("channels")
+            if not isinstance(channels, dict):
+                return []
+            channel_ids = self._principal_policy_channel_ids(source, adapter)
+            selected = None
+            for channel_id in channel_ids:
+                channel_policy = channels.get(str(channel_id))
+                if isinstance(channel_policy, dict):
+                    allowed = _coerce_allow_set(channel_policy.get("allowed_user_ids"))
+                    if source.user_id not in allowed:
+                        return []
+                    selected = channel_policy.get(tier)
+                    break
+
+        if selected == "inherit":
+            return default
+        if not isinstance(selected, (list, tuple, set)):
+            return []
+        enabled = set(default)
+        return [str(name) for name in selected if str(name) in enabled]
+
+    def _principal_channel_authorizes(self, source: SessionSource) -> bool:
+        """Authorize an explicitly listed principal in one Discord channel.
+
+        This is an intake grant only. Capability narrowing and privileged-tool
+        runtime checks remain separate gates. Thread inheritance requires the
+        live adapter's current thread-parent relationship verification.
+        """
+        if source.platform != Platform.DISCORD or source.chat_type == "dm" or not source.user_id:
+            return False
+
+        adapter, configured, policy = self._principal_policy_context(source)
+        if not configured or not isinstance(policy, dict):
+            return False
+
+        scopes = _coerce_allow_set(policy.get("scope_ids"))
+        if not scopes or source.scope_id not in scopes:
+            return False
+
+        channels = policy.get("channels")
+        if not isinstance(channels, dict):
+            return False
+
+        channel_ids = self._principal_policy_channel_ids(source, adapter)
+
+        for channel_id in channel_ids:
+            channel_policy = channels.get(str(channel_id))
+            if not isinstance(channel_policy, dict):
+                continue
+            allowed = _coerce_allow_set(channel_policy.get("allowed_user_ids"))
+            if source.user_id in allowed:
+                return True
+        return False
+
     def _authorization_adapter(
         self,
         platform: Optional[Platform],
@@ -439,6 +566,13 @@ class GatewayAuthorizationMixin:
             return True
 
         user_id = source.user_id
+
+        # Once a Discord principal policy is configured it is authoritative for
+        # non-DM intake. Do not fall through to legacy env allow-all/user lists.
+        if source.platform == Platform.DISCORD and source.chat_type != "dm":
+            _adapter, configured, _policy = self._principal_policy_context(source)
+            if configured:
+                return bool(user_id) and self._principal_channel_authorizes(source)
 
         # Telegram (and similar) authorize entire group/forum/channel chats
         # by chat ID via TELEGRAM_GROUP_ALLOWED_CHATS / QQ_GROUP_ALLOWED_USERS.
