@@ -149,6 +149,8 @@ class GatewayAuthorizationMixin:
             return default
         if not isinstance(policy, dict):
             return []
+        if source.chat_type not in {"dm", "group", "channel", "thread"}:
+            return []
 
         scopes = _coerce_allow_set(policy.get("scope_ids"))
         if not scopes or source.scope_id not in scopes:
@@ -191,7 +193,11 @@ class GatewayAuthorizationMixin:
         runtime checks remain separate gates. Thread inheritance requires the
         live adapter's current thread-parent relationship verification.
         """
-        if source.platform != Platform.DISCORD or source.chat_type == "dm" or not source.user_id:
+        if (
+            source.platform != Platform.DISCORD
+            or source.chat_type not in {"group", "channel", "thread"}
+            or not source.user_id
+        ):
             return False
 
         adapter, configured, policy = self._principal_policy_context(source)
