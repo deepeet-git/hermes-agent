@@ -3195,18 +3195,44 @@ def _principal_context_is_restricted(
     source: SessionSource,
     platform_toolsets: list[str],
     enabled_toolsets: list[str],
+    user_config: Optional[dict] = None,
 ) -> bool:
     """Return whether private memory/project context must be suppressed.
 
-    A principal-scoped Discord or unnormalized relay turn gets only the tools
-    in its authorization ceiling and must not inherit MEMORY.md, USER.md,
-    external memory providers, SOUL.md, or project context files. Owner turns
-    that inherit the complete Discord platform toolset retain existing context.
+    Any narrowed Discord/relay turn is restricted.  For a configured Discord
+    principal policy, equality with the platform tool list is not sufficient:
+    only an owner using the explicit ``inherit`` rule may receive private
+    context.  This prevents a regular or explicitly scoped principal from
+    recovering owner context by listing every currently enabled toolset.
     """
 
     if source.platform not in {Platform.DISCORD, Platform.RELAY}:
         return False
-    return sorted(enabled_toolsets) != sorted(platform_toolsets)
+    if sorted(enabled_toolsets) != sorted(platform_toolsets):
+        return True
+    if source.platform == Platform.RELAY or not isinstance(user_config, dict):
+        return False
+
+    discord_cfg = user_config.get("discord")
+    if not isinstance(discord_cfg, dict) or "principal_toolsets" not in discord_cfg:
+        return False
+    policy = discord_cfg.get("principal_toolsets")
+    if not isinstance(policy, dict):
+        return True
+
+    owners = policy.get("owner_user_ids")
+    if not isinstance(owners, list) or source.user_id not in owners:
+        return True
+    if source.chat_type == "dm":
+        dm_rule = policy.get("dm")
+        return not isinstance(dm_rule, dict) or dm_rule.get("owner") != "inherit"
+
+    channels = policy.get("channels")
+    if not isinstance(channels, dict):
+        return True
+    effective_channel = getattr(source, "_validated_parent_chat_id", None) or source.chat_id
+    channel_rule = channels.get(str(effective_channel))
+    return not isinstance(channel_rule, dict) or channel_rule.get("owner") != "inherit"
 
 
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
@@ -19406,6 +19432,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 platform_toolsets=platform_toolsets,
                 enabled_toolsets=enabled_toolsets,
+                user_config=user_config,
             )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
@@ -24212,6 +24239,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             platform_toolsets=platform_toolsets,
             enabled_toolsets=enabled_toolsets,
+            user_config=user_config,
         )
         if self._get_proxy_url():
             if self._principal_policy_blocks_proxy(source):
