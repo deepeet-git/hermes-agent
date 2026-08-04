@@ -1809,6 +1809,17 @@ def init_agent(
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+    # Route stable conceptual questions directly while preserving the full
+    # tool/verification loop for actions and live-state requests. This lives
+    # on AIAgent rather than a platform adapter so every ingress behaves alike.
+    _intent_aware_raw = _agent_section.get("intent_aware_routing", False)
+    if isinstance(_intent_aware_raw, str):
+        agent._intent_aware_routing = (
+            _intent_aware_raw.strip().lower() in {"true", "1", "yes", "on"}
+        )
+    else:
+        agent._intent_aware_routing = _intent_aware_raw is True
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the

@@ -975,6 +975,67 @@ class TestBuildSystemPrompt:
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
+    def test_intent_aware_routing_is_applied_by_the_shared_agent_core(self):
+        tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.get_toolset_for_tool", create=True, return_value="skills"),
+            patch("run_agent.build_skills_system_prompt", return_value="SELECTIVE_SKILLS") as mock_skills,
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"intent_aware_routing": True}},
+            ),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": {"intent_aware_routing": True}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "Intent-aware response routing" in prompt
+        assert "takes precedence over general tool-persistence guidance" in prompt
+        assert mock_skills.call_args.kwargs["intent_aware_routing"] is True
+
+    def test_intent_aware_routing_parses_false_string_as_disabled(self):
+        tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.get_toolset_for_tool", create=True, return_value="skills"),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS") as mock_skills,
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"intent_aware_routing": "false"}},
+            ),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": {"intent_aware_routing": "false"}},
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "Intent-aware response routing" not in prompt
+        assert mock_skills.call_args.kwargs["intent_aware_routing"] is False
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""

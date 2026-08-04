@@ -1560,6 +1560,28 @@ There is no `hermes config set` support for `reasoning_overrides` keys — edit 
 
 The override applies automatically everywhere: CLI startup, messaging gateway, Desktop/TUI, cron jobs, `/model` mid-session switches, and fallback model activation.
 
+## Intent-Aware Response Routing
+
+Enable the shared fast path when you want stable conceptual and explanatory
+questions to return directly instead of entering the procedural skill/tool loop:
+
+```yaml
+agent:
+  intent_aware_routing: true
+```
+
+When enabled, Hermes answers stable conceptual, conversational, and advisory
+questions without tools or skill loads. Requests that require actions, current
+or user-specific facts, workspace inspection, research, or verification still
+use the full agent loop. Skill activation also becomes procedural: a skill is
+loaded when its workflow is needed, not merely because its topic overlaps the
+question.
+
+The setting is implemented in the shared `AIAgent` system prompt, so it applies
+consistently to CLI, TUI, Desktop, ACP, cron, and every messaging gateway. It is
+fixed for the lifetime of a session to preserve prompt caching. Start a new
+session after changing it. The default is `false` for backward compatibility.
+
 ## Tool-Use Enforcement
 
 Some models occasionally describe intended actions as text instead of making tool calls ("I would run the tests..." instead of actually calling the terminal). Tool-use enforcement injects system prompt guidance that steers the model back to actually calling tools.

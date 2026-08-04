@@ -162,6 +162,28 @@ HERMES_AGENT_HELP_GUIDANCE = (
     "of truth when the two differ."
 )
 
+HERMES_AGENT_HELP_GUIDANCE_INTENT_AWARE = (
+    "You run on Hermes Agent (by Nous Research). For stable conceptual questions "
+    "about Hermes, answer directly without loading a skill or browsing documentation. "
+    "When the user asks to configure, set up, extend, modify, or troubleshoot Hermes "
+    "Agent — or when current behavior must be verified — load the `hermes-agent` skill "
+    "with skill_view(name='hermes-agent') and consult the authoritative documentation "
+    "at https://hermes-agent.nousresearch.com/docs. Treat the docs as the source of "
+    "truth when the skill and docs differ."
+)
+
+INTENT_AWARE_RESPONSE_GUIDANCE = (
+    "# Intent-aware response routing\n"
+    "Use the shortest path that fully satisfies the request. This routing rule "
+    "takes precedence over general tool-persistence guidance: answer stable "
+    "conceptual, explanatory, conversational, and advisory questions directly "
+    "without tools. Use tools when the request requires an external action, "
+    "current or user-specific facts, workspace or system inspection, source-backed "
+    "research, or verification. Do not turn a simple question into an investigation. "
+    "When tools are needed, batch independent calls and stop once enough evidence "
+    "exists to answer correctly."
+)
+
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "
@@ -1665,6 +1687,7 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    intent_aware_routing: bool = False,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1705,6 +1728,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        bool(intent_aware_routing),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1913,33 +1937,51 @@ def build_skills_system_prompt(
                 else:
                     index_lines.append(f"    - {name}")
 
+        if intent_aware_routing:
+            instructions = (
+                "## Skills (on demand)\n"
+                "Use skill_view(name) before procedural work when a listed skill clearly "
+                "matches the requested action or the exact workflow matters. For simple "
+                "conceptual, explanatory, or conversational questions, answer directly "
+                "without loading a skill. Load relevant skills for configuration, setup, "
+                "execution, modification, troubleshooting, verification, and specialized "
+                "workflows; do not load skills merely because the topic overlaps.\n"
+                "If a loaded skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult or iterative work, offer to save a reusable procedure as a "
+                "skill. If a loaded skill was incomplete or wrong, update it before finishing."
+            )
+            closing = "Proceed directly when no procedural skill is needed."
+        else:
+            instructions = (
+                "## Skills (mandatory)\n"
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows. "
+                "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+                "and proven workflows that outperform general-purpose approaches. Load the skill "
+                "even if you think you could handle the task with basic tools like web_search or terminal. "
+                "Skills also encode the user's preferred approach, conventions, and quality standards "
+                "for tasks like code review, planning, and testing — load them even for tasks you "
+                "already know how to do, because the skill defines how it should be done here.\n"
+                "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+                "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+                "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+                "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+                "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing."
+            )
+            closing = "Only proceed without loading a skill if genuinely none are relevant to the task."
+
         result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            instructions
+            + "\n\n<available_skills>\n"
+            + "\n".join(index_lines)
+            + "\n</available_skills>\n\n"
+            + closing
             + hidden_note
         )
 

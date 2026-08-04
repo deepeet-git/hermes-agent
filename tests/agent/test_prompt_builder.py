@@ -294,6 +294,40 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_intent_aware_routing_does_not_require_skills_for_simple_answers(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: Demo workflow\n---\n"
+        )
+
+        result = build_skills_system_prompt(intent_aware_routing=True)
+
+        assert "simple conceptual, explanatory, or conversational questions" in result
+        assert "answer directly without loading a skill" in result
+        assert "even partially relevant" not in result
+
+    def test_intent_aware_routing_uses_a_separate_stable_cache_entry(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "tools" / "demo"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: Demo workflow\n---\n"
+        )
+
+        selective = build_skills_system_prompt(intent_aware_routing=True)
+        eager = build_skills_system_prompt(intent_aware_routing=False)
+        selective_again = build_skills_system_prompt(intent_aware_routing=True)
+
+        assert "answer directly without loading a skill" in selective
+        assert "even partially relevant" in eager
+        assert selective_again == selective
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path

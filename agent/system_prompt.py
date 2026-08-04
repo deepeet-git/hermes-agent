@@ -34,6 +34,8 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
+    HERMES_AGENT_HELP_GUIDANCE_INTENT_AWARE,
+    INTENT_AWARE_RESPONSE_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -200,8 +202,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+    # Intent-aware routing is assembled in the shared AIAgent prompt, so CLI,
+    # TUI, desktop, ACP, cron, and every gateway adapter receive identical
+    # behavior. It is session-stable and therefore prompt-cache safe.
+    _intent_aware_routing = bool(getattr(agent, "_intent_aware_routing", False))
+    if _intent_aware_routing:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_INTENT_AWARE)
+        stable_parts.append(INTENT_AWARE_RESPONSE_GUIDANCE)
+    else:
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -322,6 +331,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            intent_aware_routing=_intent_aware_routing,
         )
     else:
         skills_prompt = ""

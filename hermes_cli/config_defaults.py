@@ -104,6 +104,12 @@ DEFAULT_CONFIG = {
         # (force on/off for all models), or a list of model-name substrings
         # to match (e.g. ["gpt", "codex", "gemini", "qwen"]).
         "tool_use_enforcement": "auto",
+        # Shared fast path for every AIAgent surface. When enabled, stable
+        # conceptual/explanatory questions are answered directly, while
+        # actions, live-state checks, research, and verification keep the full
+        # tool loop. Skill loading becomes procedural rather than topic-based.
+        # Disabled by default for backward compatibility.
+        "intent_aware_routing": False,
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the
