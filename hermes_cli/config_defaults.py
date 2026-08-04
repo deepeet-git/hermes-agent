@@ -82,6 +82,14 @@ DEFAULT_CONFIG = {
         # tool loop. Skill loading becomes procedural rather than topic-based.
         # Disabled by default for backward compatibility.
         "intent_aware_routing": False,
+        # Wire-level companion to intent_aware_routing. A deterministic,
+        # fail-closed classifier sends only high-confidence explanatory turns
+        # with a compact prompt/history and no tool schemas. Disabled by default
+        # for staged rollout and backwards compatibility.
+        "lean_chat_fast_path": False,
+        # Optional lean-lane reasoning override. "inherit" is the provider-safe
+        # default; operator turns always retain the main reasoning setting.
+        "lean_chat_reasoning_effort": "inherit",
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the

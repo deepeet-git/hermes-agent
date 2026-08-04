@@ -338,6 +338,61 @@ def _mock_response(
     return resp
 
 
+def test_lean_chat_fast_path_sends_compact_toolless_wire_request(agent):
+    agent._intent_aware_routing = True
+    agent._lean_chat_fast_path = True
+    agent._lean_chat_reasoning_effort = "low"
+    agent._cached_system_prompt = "FULL OPERATOR PROMPT WITH TOOL RULES"
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="Prompt caching avoids repeated prefix work."
+    )
+    original_build_api_kwargs = agent._build_api_kwargs
+    agent._build_api_kwargs = MagicMock(side_effect=original_build_api_kwargs)
+    history = [
+        {"role": "user", "content": "check the file"},
+        {
+            "role": "assistant",
+            "content": "I will check it.",
+            "tool_calls": [_mock_tool_call()],
+        },
+        {"role": "tool", "tool_call_id": "old", "content": "raw tool output"},
+        {"role": "assistant", "content": "The file is valid."},
+    ]
+
+    result = agent.run_conversation(
+        "Explain why prompt caching matters.",
+        conversation_history=history,
+    )
+
+    assert result["final_response"] == "Prompt caching avoids repeated prefix work."
+    build_call = agent._build_api_kwargs.call_args
+    assert build_call.kwargs["reasoning_config_override"] == {
+        "enabled": True,
+        "effort": "low",
+    }
+    kwargs = agent.client.chat.completions.create.call_args.kwargs
+    assert kwargs.get("tools") in (None, [])
+    sent = kwargs["messages"]
+    assert sent[0]["role"] == "system"
+    assert "lean conversational lane" in sent[0]["content"]
+    serialized = repr(sent)
+    assert "FULL OPERATOR PROMPT" not in serialized
+    assert "raw tool output" not in serialized
+
+
+def test_operator_request_keeps_full_prompt_and_tools(agent):
+    agent._intent_aware_routing = True
+    agent._lean_chat_fast_path = True
+    agent._cached_system_prompt = "FULL OPERATOR PROMPT"
+    agent.client.chat.completions.create.return_value = _mock_response(content="done")
+
+    agent.run_conversation("Check the latest logs.")
+
+    kwargs = agent.client.chat.completions.create.call_args.kwargs
+    assert kwargs.get("tools")
+    assert kwargs["messages"][0]["content"] == "FULL OPERATOR PROMPT"
+
+
 # ===================================================================
 # Group 1: Pure Functions
 # ===================================================================
@@ -1005,6 +1060,42 @@ class TestBuildSystemPrompt:
         assert "Intent-aware response routing" in prompt
         assert "takes precedence over general tool-persistence guidance" in prompt
         assert mock_skills.call_args.kwargs["intent_aware_routing"] is True
+
+    def test_lean_chat_fast_path_parses_boolean_and_false_string(self):
+        tools = _make_tool_defs("terminal")
+        for raw_value, expected in ((True, True), ("false", False)):
+            with (
+                patch("run_agent.get_tool_definitions", return_value=tools),
+                patch("run_agent.check_toolset_requirements", return_value={}),
+                patch("run_agent.OpenAI"),
+                patch(
+                    "hermes_cli.config.load_config",
+                    return_value={
+                        "agent": {
+                            "lean_chat_fast_path": raw_value,
+                            "lean_chat_reasoning_effort": "low",
+                        }
+                    },
+                ),
+                patch(
+                    "hermes_cli.config.load_config_readonly",
+                    return_value={
+                        "agent": {
+                            "lean_chat_fast_path": raw_value,
+                            "lean_chat_reasoning_effort": "low",
+                        }
+                    },
+                ),
+            ):
+                agent = AIAgent(
+                    api_key="test-key-1234567890",
+                    base_url="https://openrouter.ai/api/v1",
+                    quiet_mode=True,
+                    skip_context_files=True,
+                    skip_memory=True,
+                )
+            assert agent._lean_chat_fast_path is expected
+            assert agent._lean_chat_reasoning_effort == "low"
 
     def test_intent_aware_routing_parses_false_string_as_disabled(self):
         tools = _make_tool_defs("skills_list", "skill_view", "skill_manage")

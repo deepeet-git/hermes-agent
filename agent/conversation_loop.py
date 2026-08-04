@@ -1699,6 +1699,39 @@ def run_conversation(
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
+        # Deterministic wire-level lean lane. The full AIAgent prompt, tools,
+        # transcript, and persistence state remain untouched; only this
+        # provider request is replaced with a compact text history and no tool
+        # schemas. The classifier is fail-closed, so ambiguous/live/action
+        # requests continue through the normal operator request below.
+        _lean_chat_request = None
+        if not moa_config:
+            try:
+                from agent.lean_chat import prepare_lean_chat_request
+
+                _lean_chat_request = prepare_lean_chat_request(
+                    agent,
+                    original_user_message,
+                    api_messages,
+                )
+            except Exception:
+                request_logger.warning(
+                    "Lean chat request preparation failed; using operator lane "
+                    "(session=%s)",
+                    agent.session_id or "-",
+                    exc_info=True,
+                )
+            if _lean_chat_request is not None:
+                api_messages = _lean_chat_request.messages
+                request_logger.info(
+                    "Lean chat lane selected (session=%s history=%d effort=%s)",
+                    agent.session_id or "-",
+                    max(0, len(api_messages) - 1),
+                    (_lean_chat_request.reasoning_config or {}).get(
+                        "effort", "inherit"
+                    ),
+                )
+
         if moa_config:
             try:
                 from agent.message_content import flatten_message_text as _flatten_mt
@@ -1838,7 +1871,11 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        tools_for_api = (
+            _lean_chat_request.tools
+            if _lean_chat_request is not None
+            else agent.tools
+        )
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -1886,7 +1923,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
 
@@ -2092,7 +2129,7 @@ def run_conversation(
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
-            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(agent.tools) if agent.tools else 0}")
+            agent._vprint(f"{agent.log_prefix}   🔧 Available tools: {len(tools_for_api) if tools_for_api else 0}")
         else:
             # Animated thinking spinner in quiet mode
             face = random.choice(KawaiiSpinner.get_thinking_faces())
@@ -2110,7 +2147,7 @@ def run_conversation(
         
         # Log request details if verbose
         if agent.verbose_logging:
-            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(agent.tools) if agent.tools else 0}")
+            logging.debug(f"API Request - Model: {agent.model}, Messages: {len(messages)}, Tools: {len(tools_for_api) if tools_for_api else 0}")
             logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
@@ -2199,12 +2236,18 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
+                _lean_reasoning = (
+                    _lean_chat_request.reasoning_config
+                    if _lean_chat_request is not None
+                    else None
+                )
+                if tools_for_api == agent.tools and _lean_reasoning is None:
                     api_kwargs = agent._build_api_kwargs(api_messages)
                 else:
                     api_kwargs = agent._build_api_kwargs(
                         api_messages,
                         tools_for_api=tools_for_api,
+                        reasoning_config_override=_lean_reasoning,
                     )
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)

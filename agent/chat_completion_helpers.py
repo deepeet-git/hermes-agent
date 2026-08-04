@@ -1120,10 +1120,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+def build_api_kwargs(
+    agent,
+    api_messages: list,
+    tools_for_api: list | None = None,
+    reasoning_config_override: dict | None = None,
+) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
+    reasoning_config = (
+        reasoning_config_override
+        if reasoning_config_override is not None
+        else agent.reasoning_config
+    )
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1138,7 +1148,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             messages=anthropic_messages,
             tools=tools_for_api,
             max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=reasoning_config,
             is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
@@ -1220,7 +1230,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=reasoning_config,
             session_id=getattr(agent, "session_id", None),
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
@@ -1326,7 +1336,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             max_tokens=agent.max_tokens,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=reasoning_config,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
@@ -1358,7 +1368,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         max_tokens=agent.max_tokens,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
-        reasoning_config=agent.reasoning_config,
+        reasoning_config=reasoning_config,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),

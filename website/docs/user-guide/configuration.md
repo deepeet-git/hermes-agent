@@ -1522,19 +1522,33 @@ questions to return directly instead of entering the procedural skill/tool loop:
 ```yaml
 agent:
   intent_aware_routing: true
+  lean_chat_fast_path: true
+  lean_chat_reasoning_effort: low
 ```
 
-When enabled, Hermes answers stable conceptual, conversational, and advisory
-questions without tools or skill loads. Requests that require actions, current
-or user-specific facts, workspace inspection, research, or verification still
-use the full agent loop. Skill activation also becomes procedural: a skill is
-loaded when its workflow is needed, not merely because its topic overlaps the
-question.
+`intent_aware_routing` changes the shared system guidance so stable conceptual,
+conversational, and advisory questions do not enter a procedural skill/tool
+loop. `lean_chat_fast_path` is its optional wire-level companion: before the
+first model request, a deterministic fail-closed classifier recognizes only
+high-confidence explanatory turns and sends a compact text-only history with
+no tool schemas. This reduces first-response latency instead of merely reducing
+follow-up model/tool round trips. `lean_chat_reasoning_effort` defaults to
+`inherit` for provider compatibility and applies only to lean turns. Set it to
+`low` only for a provider/model that supports reasoning effort overrides;
+operator turns retain the normal global or per-model reasoning configuration.
 
-The setting is implemented in the shared `AIAgent` system prompt, so it applies
-consistently to CLI, TUI, Desktop, ACP, cron, and every messaging gateway. It is
-fixed for the lifetime of a session to preserve prompt caching. Start a new
-session after changing it. The default is `false` for backward compatibility.
+Requests that mention live/current state, user or workspace data, URLs, files,
+research, arithmetic, verification, or external actions stay on the full
+operator lane. Ambiguous requests also fail closed to that lane. The lean lane
+omits owner memory/profile data and raw tool output, and it never mutates the
+persisted transcript, full agent prompt, or tool registry. Questions about the
+user's identity, preferences, or private state therefore stay on the operator
+lane; later operator turns retain the same history and safety behavior.
+
+Both settings are implemented in the shared `AIAgent` core, so they apply
+consistently to CLI, TUI, Desktop, ACP, cron, API, and every messaging gateway.
+Their defaults are `false` for backward compatibility. Start a new session (or
+recreate a cached gateway agent) after changing either setting.
 
 ## Tool-Use Enforcement
 

@@ -1778,6 +1778,38 @@ def init_agent(
     else:
         agent._intent_aware_routing = _intent_aware_raw is True
 
+    # Optional wire-level fast lane for high-confidence explanatory turns.
+    # It uses a deterministic fail-closed classifier, a compact prompt/history,
+    # and no tool schemas. Separate from intent_aware_routing for backwards
+    # compatibility and safe staged rollout.
+    _lean_chat_raw = _agent_section.get("lean_chat_fast_path", False)
+    if isinstance(_lean_chat_raw, str):
+        agent._lean_chat_fast_path = (
+            _lean_chat_raw.strip().lower() in {"true", "1", "yes", "on"}
+        )
+    else:
+        agent._lean_chat_fast_path = _lean_chat_raw is True
+    _lean_effort = str(
+        _agent_section.get("lean_chat_reasoning_effort", "inherit") or "inherit"
+    ).strip().lower()
+    if _lean_effort not in {
+        "inherit",
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    }:
+        logger.warning(
+            "Invalid agent.lean_chat_reasoning_effort=%r; falling back to 'inherit'",
+            _lean_effort,
+        )
+        _lean_effort = "inherit"
+    agent._lean_chat_reasoning_effort = _lean_effort
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the
