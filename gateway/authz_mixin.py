@@ -182,7 +182,7 @@ class GatewayAuthorizationMixin:
                     selected = channel_policy.get(tier)
                     break
 
-        if selected == "inherit":
+        if tier == "owner" and selected == "inherit":
             return default
         if not isinstance(selected, (list, tuple, set)):
             return []

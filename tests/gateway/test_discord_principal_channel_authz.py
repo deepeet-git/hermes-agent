@@ -178,6 +178,25 @@ def test_principal_policy_denial_cannot_fall_through_legacy_allow_all(monkeypatc
     assert _runner(_policy())._is_user_authorized(source) is False
 
 
+def test_regular_principal_cannot_inherit_owner_toolsets(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    policy = _policy()
+    policy["channels"]["pdp-channel"]["regular"] = "inherit"
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="pdp-channel",
+        chat_type="channel",
+        user_id="jhm",
+        scope_id="guild-1",
+    )
+
+    runner = _runner(policy)
+    assert runner._is_user_authorized(source) is False
+    assert runner._principal_effective_toolsets(
+        source, ["terminal", "file", "deepeet-pdp", "web"]
+    ) == []
+
+
 def test_principal_policy_rejects_wildcard_user_and_scope(monkeypatch):
     _clear_auth_env(monkeypatch)
     policy = _policy()
