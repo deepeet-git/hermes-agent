@@ -187,6 +187,74 @@ def test_scoped_discord_turn_suppresses_private_context() -> None:
     ) is False
 
 
+def test_configured_regular_with_all_tools_still_suppresses_private_context() -> None:
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="general",
+        chat_type="group",
+        user_id="regular",
+    )
+    config = {
+        "discord": {
+            "principal_toolsets": {
+                "owner_user_ids": ["owner"],
+                "channels": {
+                    "general": {
+                        "owner": "inherit",
+                        "regular": ["terminal", "web"],
+                    }
+                },
+            }
+        }
+    }
+
+    assert _principal_context_is_restricted(
+        source=source,
+        platform_toolsets=["terminal", "web"],
+        enabled_toolsets=["terminal", "web"],
+        user_config=config,
+    ) is True
+
+
+def test_only_owner_inherit_retains_private_context() -> None:
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="general",
+        chat_type="group",
+        user_id="owner",
+    )
+    config = {
+        "discord": {
+            "principal_toolsets": {
+                "owner_user_ids": ["owner"],
+                "channels": {
+                    "general": {
+                        "owner": "inherit",
+                        "regular": ["web"],
+                    }
+                },
+            }
+        }
+    }
+
+    assert _principal_context_is_restricted(
+        source=source,
+        platform_toolsets=["terminal", "web"],
+        enabled_toolsets=["terminal", "web"],
+        user_config=config,
+    ) is False
+    config["discord"]["principal_toolsets"]["channels"]["general"]["owner"] = [
+        "terminal",
+        "web",
+    ]
+    assert _principal_context_is_restricted(
+        source=source,
+        platform_toolsets=["terminal", "web"],
+        enabled_toolsets=["terminal", "web"],
+        user_config=config,
+    ) is True
+
+
 def test_non_discord_toolset_difference_does_not_suppress_context() -> None:
     source = SessionSource(
         platform=Platform.TELEGRAM,
