@@ -4806,7 +4806,9 @@ class TurnRunner:
                 enabled_toolsets=ctx.enabled_toolsets,
                 disabled_toolsets=ctx.disabled_toolsets,
                 skip_memory=ctx.restrict_private_context,
-                skip_context_files=ctx.restrict_private_context,
+                skip_context_files=(
+                    ctx.restrict_private_context or skip_context_files
+                ),
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
@@ -4831,7 +4833,6 @@ class TurnRunner:
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
-                skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
