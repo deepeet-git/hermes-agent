@@ -68,6 +68,45 @@ def test_discord_channel_principal_allowlist_authorizes_regular_user(monkeypatch
     assert _runner(_policy())._is_user_authorized(source) is True
 
 
+def test_discord_channel_without_allowlist_authorizes_restricted_regular_role(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    policy = _policy()
+    policy["channels"]["pdp-channel"].pop("allowed_user_ids")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="pdp-channel",
+        chat_type="channel",
+        user_id="regular-user",
+        scope_id="guild-1",
+    )
+
+    runner = _runner(policy)
+    assert runner._is_user_authorized(source) is True
+    assert runner._principal_effective_toolsets(
+        source, ["terminal", "deepeet-pdp", "web"]
+    ) == ["deepeet-pdp", "web"]
+
+
+def test_discord_channel_without_allowlist_or_regular_capability_denies(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    policy = _policy()
+    policy["channels"]["pdp-channel"].pop("allowed_user_ids")
+    policy["channels"]["pdp-channel"].pop("regular")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="pdp-channel",
+        chat_type="channel",
+        user_id="regular-user",
+        scope_id="guild-1",
+    )
+
+    runner = _runner(policy)
+    assert runner._is_user_authorized(source) is False
+    assert runner._principal_effective_toolsets(
+        source, ["deepeet-pdp", "web"]
+    ) == []
+
+
 def test_discord_thread_inherits_verified_parent_principal_allowlist(monkeypatch):
     _clear_auth_env(monkeypatch)
     source = SessionSource(

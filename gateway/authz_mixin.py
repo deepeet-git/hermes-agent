@@ -173,9 +173,12 @@ class GatewayAuthorizationMixin:
             for channel_id in channel_ids:
                 channel_policy = channels.get(str(channel_id))
                 if isinstance(channel_policy, dict):
-                    allowed = _coerce_allow_set(channel_policy.get("allowed_user_ids"))
-                    if source.user_id not in allowed:
-                        return []
+                    if "allowed_user_ids" in channel_policy:
+                        allowed = _coerce_allow_set(
+                            channel_policy.get("allowed_user_ids")
+                        )
+                        if source.user_id not in allowed:
+                            return []
                     selected = channel_policy.get(tier)
                     break
 
@@ -207,6 +210,9 @@ class GatewayAuthorizationMixin:
         scopes = _coerce_allow_set(policy.get("scope_ids"))
         if not scopes or source.scope_id not in scopes:
             return False
+        owners = _coerce_allow_set(policy.get("owner_user_ids"))
+        if not owners:
+            return False
 
         channels = policy.get("channels")
         if not isinstance(channels, dict):
@@ -218,8 +224,15 @@ class GatewayAuthorizationMixin:
             channel_policy = channels.get(str(channel_id))
             if not isinstance(channel_policy, dict):
                 continue
-            allowed = _coerce_allow_set(channel_policy.get("allowed_user_ids"))
-            if source.user_id in allowed:
+            if "allowed_user_ids" in channel_policy:
+                allowed = _coerce_allow_set(channel_policy.get("allowed_user_ids"))
+                if source.user_id not in allowed:
+                    continue
+            role = "owner" if source.user_id in owners else "regular"
+            selected = channel_policy.get(role)
+            if role == "owner" and selected == "inherit":
+                return True
+            if isinstance(selected, (list, tuple, set)) and bool(selected):
                 return True
         return False
 
