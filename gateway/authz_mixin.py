@@ -607,6 +607,33 @@ class GatewayAuthorizationMixin:
         global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
+            # Discord can intentionally authorize a shared guild channel without
+            # opening DMs or configuring a platform-wide user allowlist. The
+            # adapter validates the live channel/thread context before building
+            # the source; preserve that decision at this second gateway gate.
+            # Require in-process adapter provenance so restored or hand-built
+            # SessionSource objects cannot forge a channel authorization.
+            if (
+                source.platform == Platform.DISCORD
+                and source.chat_type != "dm"
+            ):
+                adapter = self._registered_transport_adapter(source)
+                channel_check = getattr(
+                    adapter, "_discord_channel_ids_allowed", None
+                ) if adapter is not None else None
+                if callable(channel_check):
+                    channel_ids = {
+                        str(value)
+                        for value in (
+                            source.chat_id,
+                            source.parent_chat_id,
+                            source.thread_id,
+                        )
+                        if value
+                    }
+                    if channel_ids and channel_check(channel_ids):
+                        return True
+
             # No env allowlist configured. Adapters that own their own
             # config-driven access policy (dm_policy / group_policy /
             # allow_from / group_allow_from) gate access at intake, so for those
