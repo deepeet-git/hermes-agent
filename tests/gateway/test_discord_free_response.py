@@ -358,7 +358,7 @@ async def test_fetch_channel_context_skips_self_improvement_boundary_message(ada
             ),
             make_history_message(
                 author=codex,
-                content="♻ Gateway restarted successfully. Your session continues.",
+                content="야생의 우렁이가 나타났다!",
                 msg_id=7,
             ),
             make_history_message(

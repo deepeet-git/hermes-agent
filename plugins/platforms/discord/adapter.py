@@ -118,6 +118,7 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
+    re.compile(r"^\s*야생의 우렁이가 (?:사라졌다|나타났다)!\s*$"),
 )
 try:
     import discord

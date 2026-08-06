@@ -255,7 +255,7 @@ gateway:
 
   restart:
     in_progress:           "⏳ Gateway restart already in progress..."
-    restarting:            "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
+    restarting:            "야생의 우렁이가 사라졌다!"
 
   resume:
     db_unavailable:        "Session database not available."

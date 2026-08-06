@@ -745,10 +745,7 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
-    ]
+    assert adapter.sent == ["야생의 우렁이가 사라졌다!"]
 
 
 @pytest.mark.asyncio
