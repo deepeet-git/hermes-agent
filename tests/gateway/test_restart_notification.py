@@ -52,7 +52,7 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     )
 
     result = await runner._handle_restart_command(event)
-    assert result == "야생의 우렁이가 사라졌다!"
+    assert result == ""
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
@@ -62,6 +62,35 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     assert data["chat_type"] == "dm"
     assert data["message_id"] == "m1"
     assert "thread_id" not in data  # no thread → omitted
+
+
+@pytest.mark.asyncio
+async def test_restart_sends_disappearance_before_requesting_restart(tmp_path, monkeypatch):
+    """The old process must announce its exit before the new one announces startup."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    order = []
+
+    async def _send(*_args, **_kwargs):
+        order.append("disappeared")
+        return SendResult(success=True, message_id="gone")
+
+    adapter.send = AsyncMock(side_effect=_send)
+    runner.request_restart = MagicMock(
+        side_effect=lambda **_kwargs: order.append("restart_requested") or True
+    )
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+        message_id="m1",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == ""
+    assert order == ["disappeared", "restart_requested"]
 
 
 @pytest.mark.asyncio

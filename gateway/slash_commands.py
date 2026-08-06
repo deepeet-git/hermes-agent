@@ -1607,6 +1607,42 @@ class GatewaySlashCommandsMixin:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
+
+        # With no work to drain, deliver the departure line from the old
+        # process before asking the supervisor to replace it. Returning this
+        # text through normal slash-command dispatch is racy: the new process
+        # can send its startup line before the old process flushes the reply.
+        departure_sent = False
+        if not active_agents:
+            try:
+                source = event.source
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    metadata = self._thread_metadata_for_target(
+                        source.platform,
+                        str(source.chat_id),
+                        source.thread_id,
+                        chat_type=source.chat_type,
+                        reply_to_message_id=event.message_id,
+                        adapter=adapter,
+                    )
+                    from gateway.run import _non_conversational_metadata
+
+                    result = await adapter.send(
+                        str(source.chat_id),
+                        t("gateway.restart.restarting"),
+                        metadata=_non_conversational_metadata(
+                            metadata,
+                            platform=source.platform,
+                        ),
+                    )
+                    departure_sent = not (
+                        result is not None
+                        and getattr(result, "success", True) is False
+                    )
+            except Exception as exc:
+                logger.warning("Restart departure notification failed: %s", exc)
+
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
@@ -1629,6 +1665,8 @@ class GatewaySlashCommandsMixin:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
             return t("gateway.draining", count=active_agents)
+        if departure_sent:
+            return ""
         return EphemeralReply(t("gateway.restart.restarting"))
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
