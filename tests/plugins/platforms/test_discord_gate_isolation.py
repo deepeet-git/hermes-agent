@@ -35,6 +35,7 @@ GATE_VARS = [
     "GATEWAY_ALLOWED_USERS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_THREADED_RESPONSE_CHANNELS",
     "DISCORD_ALLOW_BOTS",
 ]
 
@@ -309,6 +310,7 @@ class TestYamlBridgeSeeding:
                 "allow_from": ["1001"],
                 "allowed_roles": [31],
                 "allow_all_users": False,
+                "threaded_response_channels": ["444", "445"],
             },
         )
         assert seeded["allowed_channels"] == "111,112"
@@ -316,8 +318,10 @@ class TestYamlBridgeSeeding:
         assert seeded["allow_from"] == "1001"
         assert seeded["allowed_roles"] == "31"
         assert seeded["allow_all_users"] == "false"
+        assert seeded["threaded_response_channels"] == "444,445"
         # Legacy env bridge preserved for single-profile deployments.
         assert os.environ["DISCORD_ALLOWED_CHANNELS"] == "111,112"
+        assert os.environ["DISCORD_THREADED_RESPONSE_CHANNELS"] == "444,445"
 
     def test_profile_scoped_load_skips_env_bridge(self, monkeypatch):
         from agent import secret_scope

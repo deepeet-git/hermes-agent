@@ -335,6 +335,7 @@ discord:
   require_mention: true           # Require @mention in server channels
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
+  threaded_response_channels: ""  # Mention-free channels that create a thread per message
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
@@ -402,11 +403,25 @@ If a thread's parent channel is in this list, the thread also becomes mention-fr
 
 Free-response channels also **skip auto-threading** — the bot replies inline rather than spinning off a new thread per message. This keeps the channel usable as a lightweight chat surface. If you want threading behavior, don't list the channel as free-response (use normal `@mention` flow instead).
 
+#### `discord.threaded_response_channels`
+
+**Type:** string or list — **Default:** `""`
+
+Channel IDs where every message is accepted without an `@mention` and routed into a newly created thread. Use this for task intake channels that should support natural-language requests while keeping each request and response isolated from the parent channel.
+
+```yaml
+discord:
+  threaded_response_channels:
+    - 1234567890
+```
+
+Do not list the same channel in `free_response_channels`: inline free-response behavior takes precedence. `no_thread_channels` also disables thread creation.
+
 #### `discord.auto_thread`
 
 **Type:** boolean — **Default:** `true`
 
-When enabled, every `@mention` in a regular text channel automatically creates a new thread for the conversation. This keeps the main channel clean and gives each conversation its own isolated session history. Once a thread is created, subsequent messages in that thread don't require `@mention` — the bot knows it's already participating. Set [`thread_require_mention`](#discordthread_require_mention) to `true` to disable this in-thread shortcut for multi-bot setups.
+When enabled, every `@mention` in a regular text channel—and every message in `threaded_response_channels`—automatically creates a new thread for the conversation. This keeps the main channel clean and gives each conversation its own isolated session history. Once a thread is created, subsequent messages in that thread don't require `@mention` — the bot knows it's already participating. Set [`thread_require_mention`](#discordthread_require_mention) to `true` to disable this in-thread shortcut for multi-bot setups.
 
 Messages sent in existing threads or DMs are unaffected by this setting. Channels listed in `discord.free_response_channels` or `discord.no_thread_channels` also bypass auto-threading and get inline replies instead.
 

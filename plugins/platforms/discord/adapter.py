@@ -388,6 +388,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_IGNORED_CHANNELS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_THREADED_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
@@ -6311,6 +6312,16 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_threaded_response_channels(self) -> set:
+        """Return mention-free Discord channels that still auto-create threads."""
+        raw = self.config.extra.get("threaded_response_channels")
+        if raw is None:
+            raw = self._gate_env("DISCORD_THREADED_RESPONSE_CHANNELS")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        value = str(raw).strip() if raw is not None else ""
+        return {part.strip() for part in value.split(",") if part.strip()}
+
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
 
@@ -7661,7 +7672,8 @@ class DiscordAdapter(BasePlatformAdapter):
         #
         # Config (all settable via discord.* in config.yaml or DISCORD_* env vars):
         #   discord.require_mention: Require @mention in server channels (default: true)
-        #   discord.free_response_channels: Channel IDs where bot responds without mention
+        #   discord.free_response_channels: Mention-free channels with inline replies
+        #   discord.threaded_response_channels: Mention-free channels with auto-threads
         #   discord.ignored_channels: Channel IDs where bot NEVER responds (even when mentioned)
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
@@ -7718,6 +7730,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False
 
             free_channels = self._discord_free_response_channels()
+            threaded_channels = self._discord_threaded_response_channels()
 
             require_mention = self._discord_require_mention()
             # Voice-linked text channels act as free-response while voice is active.
@@ -7729,6 +7742,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
                 or is_voice_linked_channel
+            )
+            is_threaded_response_channel = (
+                "*" in threaded_channels
+                or bool(channel_keys & threaded_channels)
             )
 
             # Skip the mention check if the message is in a thread where
@@ -7742,7 +7759,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
-            if require_mention and not is_free_channel and not in_bot_thread:
+            if (
+                require_mention
+                and not is_free_channel
+                and not is_threaded_response_channel
+                and not in_bot_thread
+            ):
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
         # Auto-thread: when enabled, automatically create a thread for every
@@ -9983,6 +10005,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["free_response_channels"] = str(frc)
         if not _skip_env_bridge and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+    trc = discord_cfg.get("threaded_response_channels")
+    if trc is not None:
+        if isinstance(trc, list):
+            trc = ",".join(str(v) for v in trc)
+        seeded_extra["threaded_response_channels"] = str(trc)
+        if not _skip_env_bridge and not os.getenv("DISCORD_THREADED_RESPONSE_CHANNELS"):
+            os.environ["DISCORD_THREADED_RESPONSE_CHANNELS"] = str(trc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
@@ -10116,8 +10145,8 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of ``config.yaml``
         # ``discord:`` keys (require_mention, free_response_channels,
-        # auto_thread, reactions, ignored_channels, allowed_channels,
-        # no_thread_channels, allow_mentions.*, reply_to_mode,
+        # threaded_response_channels, auto_thread, reactions, ignored_channels,
+        # allowed_channels, no_thread_channels, allow_mentions.*, reply_to_mode,
         # thread_require_mention) into ``DISCORD_*`` env vars that the
         # adapter reads via ``os.getenv()``.  Replaces the hardcoded block
         # that used to live in ``gateway/config.py``.  Hook contract: #24836.
