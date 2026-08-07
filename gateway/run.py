@@ -14022,10 +14022,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ) -> bool:
             if not user_id:
                 return False
+
+            # Discord history is fetched after intake and only carries a user ID
+            # plus the current channel ID. Rebuild the immutable guild/thread
+            # context from the live adapter cache before applying principal
+            # policy; otherwise approved collaborators are falsely tagged
+            # [unverified] because scope_id and parent_chat_id are missing.
+            trusted_context: Dict[str, Any] = {}
+            if platform == Platform.DISCORD and chat_id:
+                adapter = self._authorization_adapter(platform, profile=profile_name)
+                resolver = getattr(adapter, "authorization_context_for_chat", None)
+                if callable(resolver):
+                    try:
+                        candidate = resolver(chat_id)
+                    except Exception:
+                        candidate = None
+                    if (
+                        isinstance(candidate, dict)
+                        and str(candidate.get("chat_id") or "") == str(chat_id)
+                    ):
+                        trusted_context = candidate
+
             source = SessionSource(
                 platform=platform,
-                chat_id=chat_id or "",
-                chat_type=chat_type or "group",
+                chat_id=str(trusted_context.get("chat_id") or chat_id or ""),
+                chat_type=str(trusted_context.get("chat_type") or chat_type or "group"),
+                thread_id=trusted_context.get("thread_id"),
+                parent_chat_id=trusted_context.get("parent_chat_id"),
+                scope_id=trusted_context.get("scope_id"),
                 user_id=user_id,
                 profile=profile_name,
             )

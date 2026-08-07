@@ -6723,6 +6723,41 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return the parent text channel when invoked from a thread."""
         return getattr(channel, "parent", None) or channel
 
+    def authorization_context_for_chat(self, chat_id: str) -> Optional[Dict[str, str]]:
+        """Resolve trusted guild/thread fields for fetched history authorization."""
+        client = self._client
+        if client is None or discord is None:
+            return None
+        try:
+            channel = client.get_channel(int(chat_id))
+        except (TypeError, ValueError):
+            return None
+        if channel is None:
+            return None
+
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        channel_id = getattr(channel, "id", None)
+        if guild_id is None or channel_id is None or str(channel_id) != str(chat_id):
+            return None
+
+        context: Dict[str, str] = {
+            "chat_id": str(channel_id),
+            "chat_type": "channel",
+            "scope_id": str(guild_id),
+        }
+        if isinstance(channel, discord.Thread):
+            parent_id = getattr(channel, "parent_id", None)
+            if parent_id is None:
+                parent_id = getattr(getattr(channel, "parent", None), "id", None)
+            if parent_id is None:
+                return None
+            context.update(
+                chat_type="thread",
+                thread_id=str(channel_id),
+                parent_chat_id=str(parent_id),
+            )
+        return context
+
     def verified_parent_chat_id(self, source: Any) -> Optional[str]:
         """Revalidate a thread parent from Discord's live channel cache."""
         if not source.parent_chat_id or not source.chat_id:

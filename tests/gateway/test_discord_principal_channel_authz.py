@@ -122,6 +122,28 @@ def test_discord_thread_inherits_verified_parent_principal_allowlist(monkeypatch
     assert _runner(_policy(), verified_parent=True)._is_user_authorized(source) is True
 
 
+def test_adapter_history_auth_rebuilds_verified_discord_thread_context(monkeypatch):
+    """Fetched Discord history must not downgrade an approved user to unverified."""
+    _clear_auth_env(monkeypatch)
+    runner = _runner(_policy(), verified_parent=True)
+    adapter = runner.adapters[Platform.DISCORD]
+    setattr(
+        adapter,
+        "authorization_context_for_chat",
+        lambda chat_id: {
+            "chat_id": chat_id,
+            "chat_type": "thread",
+            "thread_id": chat_id,
+            "parent_chat_id": "pdp-channel",
+            "scope_id": "guild-1",
+        },
+    )
+
+    check = runner._make_adapter_auth_check(Platform.DISCORD)
+
+    assert check("jhm", "thread", "thread-1") is True
+
+
 def test_discord_thread_parent_requires_live_adapter_verification(monkeypatch):
     _clear_auth_env(monkeypatch)
     live_source = SessionSource(
@@ -454,13 +476,14 @@ def test_discord_adapter_revalidates_parent_and_scope_from_live_cache(monkeypatc
     from plugins.platforms.discord import adapter as discord_adapter_module
 
     class FakeThread:
-        def __init__(self, *, parent_id, guild_id):
+        def __init__(self, *, channel_id, parent_id, guild_id):
+            self.id = channel_id
             self.parent_id = parent_id
             self.guild = SimpleNamespace(id=guild_id)
 
     monkeypatch.setattr(discord_adapter_module.discord, "Thread", FakeThread)
     adapter = object.__new__(discord_adapter_module.DiscordAdapter)
-    channel = FakeThread(parent_id=123, guild_id=456)
+    channel = FakeThread(channel_id=789, parent_id=123, guild_id=456)
     adapter._client = SimpleNamespace(get_channel=lambda channel_id: channel)
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -472,6 +495,13 @@ def test_discord_adapter_revalidates_parent_and_scope_from_live_cache(monkeypatc
         scope_id="456",
     )
 
+    assert adapter.authorization_context_for_chat("789") == {
+        "chat_id": "789",
+        "chat_type": "thread",
+        "scope_id": "456",
+        "thread_id": "789",
+        "parent_chat_id": "123",
+    }
     assert adapter.verified_parent_chat_id(source) == "123"
 
     channel.parent_id = 999
