@@ -392,6 +392,16 @@ async def test_fetch_channel_context_skips_self_improvement_boundary_message(ada
             ),
             make_history_message(
                 author=codex,
+                content="야생의 우렁이가 나타났다!",
+                msg_id=71,
+            ),
+            make_history_message(
+                author=codex,
+                content="야생의 우렁이가 사라졌다!",
+                msg_id=72,
+            ),
+            make_history_message(
+                author=codex,
                 content="💾 Self-improvement review: Memory updated",
                 msg_id=6,
             ),

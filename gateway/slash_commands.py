@@ -1607,6 +1607,48 @@ class GatewaySlashCommandsMixin:
             logger.debug("Failed to write restart dedup marker: %s", e)
 
         active_agents = self._running_agent_count()
+
+        # A chat-originated restart skips the generic home-channel shutdown
+        # broadcast. With no active turn there would otherwise be no departure
+        # line at all, so send the Discord lifecycle line before the old process
+        # asks its supervisor to replace it.
+        departure_sent = False
+        if not active_agents and event.source.platform == Platform.DISCORD:
+            config = getattr(self, "config")
+            platform_cfg = config.platforms.get(Platform.DISCORD)
+            if platform_cfg is None or platform_cfg.gateway_restart_notification:
+                try:
+                    source = event.source
+                    adapter = getattr(self, "_adapter_for_source")(source)
+                    if adapter is not None:
+                        metadata = getattr(self, "_thread_metadata_for_target")(
+                            source.platform,
+                            str(source.chat_id),
+                            source.thread_id,
+                            chat_type=source.chat_type,
+                            reply_to_message_id=event.message_id,
+                            adapter=adapter,
+                        )
+                        from gateway.run import (
+                            _DISCORD_GATEWAY_DEPARTURE_MESSAGE,
+                            _non_conversational_metadata,
+                        )
+
+                        result = await adapter.send(
+                            str(source.chat_id),
+                            _DISCORD_GATEWAY_DEPARTURE_MESSAGE,
+                            metadata=_non_conversational_metadata(
+                                metadata,
+                                platform=source.platform,
+                            ),
+                        )
+                        departure_sent = not (
+                            result is not None
+                            and getattr(result, "success", True) is False
+                        )
+                except Exception as exc:
+                    logger.warning("Restart departure notification failed: %s", exc)
+
         # When running under a service manager (systemd/launchd) or inside a
         # Docker/Podman container, use the service restart path: exit with
         # code 75 so the service manager / container restart policy restarts
@@ -1629,6 +1671,8 @@ class GatewaySlashCommandsMixin:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
             return t("gateway.draining", count=active_agents)
+        if departure_sent:
+            return ""
         return EphemeralReply(t("gateway.restart.restarting"))
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
