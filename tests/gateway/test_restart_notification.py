@@ -1,7 +1,9 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -14,6 +16,16 @@ from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
 )
+
+
+def make_discord_restart_runner():
+    runner, base_adapter = make_restart_runner()
+    adapter: Any = base_adapter
+    runner.config.platforms = {
+        Platform.DISCORD: PlatformConfig(enabled=True, token="***")
+    }
+    runner.adapters = {Platform.DISCORD: adapter}
+    return runner, adapter
 
 
 # ── restart marker helpers ───────────────────────────────────────────────
@@ -390,6 +402,81 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
         metadata={"thread_id": "topic-7"},
     )
+
+
+@pytest.mark.asyncio
+async def test_discord_home_startup_uses_oorung_arrival_message():
+    runner, adapter = make_discord_restart_runner()
+    runner.config.platforms[Platform.DISCORD].home_channel = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="home-42",
+        name="Oorung Home",
+    )
+
+    await runner._send_home_channel_startup_notifications()
+
+    assert adapter.sent == ["야생의 우렁이가 나타났다!"]
+
+
+@pytest.mark.asyncio
+async def test_discord_restart_notification_uses_oorung_arrival_message(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(json.dumps({
+        "platform": "discord",
+        "chat_id": "42",
+    }))
+    runner, adapter = make_discord_restart_runner()
+
+    await runner._send_restart_notification()
+
+    assert adapter.sent == ["야생의 우렁이가 나타났다!"]
+
+
+@pytest.mark.asyncio
+async def test_discord_shutdown_uses_oorung_departure_message():
+    runner, adapter = make_discord_restart_runner()
+    source = replace(
+        make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7"),
+        platform=Platform.DISCORD,
+    )
+    session_key = build_session_key(source)
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == ["야생의 우렁이가 사라졌다!"]
+
+
+@pytest.mark.asyncio
+async def test_discord_restart_sends_departure_before_requesting_restart(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_discord_restart_runner()
+    order = []
+
+    async def send(*_args, **_kwargs):
+        order.append("departed")
+        return SendResult(success=True, message_id="gone")
+
+    adapter.send = AsyncMock(side_effect=send)
+    runner.request_restart = MagicMock(
+        side_effect=lambda **_kwargs: order.append("restart_requested") or True
+    )
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=replace(make_restart_source(chat_id="42"), platform=Platform.DISCORD),
+        message_id="m1",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == ""
+    assert order == ["departed", "restart_requested"]
 
 
 @pytest.mark.asyncio

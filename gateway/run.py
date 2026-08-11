@@ -2884,6 +2884,21 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
+_DISCORD_GATEWAY_DEPARTURE_MESSAGE = "야생의 우렁이가 사라졌다!"
+_DISCORD_GATEWAY_ARRIVAL_MESSAGE = "야생의 우렁이가 나타났다!"
+
+
+def _gateway_departure_message(platform: Platform, default: str) -> str:
+    if platform == Platform.DISCORD:
+        return _DISCORD_GATEWAY_DEPARTURE_MESSAGE
+    return default
+
+
+def _gateway_arrival_message(platform: Platform, default: str) -> str:
+    if platform == Platform.DISCORD:
+        return _DISCORD_GATEWAY_ARRIVAL_MESSAGE
+    return default
+
 
 def _reap_gateway_turn_processes(
     task_id: str,
@@ -9690,7 +9705,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                result = await adapter.send(
+                    chat_id,
+                    _gateway_departure_message(platform, msg),
+                    metadata=metadata,
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -9771,9 +9790,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
                 if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
+                    result = await adapter.send(
+                        str(home.chat_id),
+                        _gateway_departure_message(platform, msg),
+                        metadata=metadata,
+                    )
                 else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                    result = await adapter.send(
+                        str(home.chat_id),
+                        _gateway_departure_message(platform, msg),
+                    )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
@@ -21996,7 +22022,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await transport.send(
                 platform,
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                _gateway_arrival_message(
+                    platform,
+                    "♻ Gateway restarted successfully. Your session continues.",
+                ),
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -22037,9 +22066,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
-
         for platform, platform_cfg in self.config.platforms.items():
+            message = _gateway_arrival_message(
+                platform,
+                "♻️ Gateway online — Hermes is back and ready.",
+            )
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue
