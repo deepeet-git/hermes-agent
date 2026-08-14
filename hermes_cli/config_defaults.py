@@ -110,6 +110,12 @@ DEFAULT_CONFIG = {
         # tool loop. Skill loading becomes procedural rather than topic-based.
         # Disabled by default for backward compatibility.
         "intent_aware_routing": False,
+        # Conservative runtime fast path for clear short conversation and
+        # feedback. The first request omits tool schemas and uses the configured
+        # low reasoning effort. Actions, live-state checks, attachments, code,
+        # and ambiguous input remain on the normal operator path.
+        "lean_chat_fast_path": False,
+        "lean_chat_reasoning_effort": "low",
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the

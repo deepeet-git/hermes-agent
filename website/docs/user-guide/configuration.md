@@ -1582,6 +1582,23 @@ consistently to CLI, TUI, Desktop, ACP, cron, and every messaging gateway. It is
 fixed for the lifetime of a session to preserve prompt caching. Start a new
 session after changing it. The default is `false` for backward compatibility.
 
+For a runtime-enforced subset of this behavior, enable the conservative lean
+chat path:
+
+```yaml
+agent:
+  intent_aware_routing: true
+  lean_chat_fast_path: true
+  lean_chat_reasoning_effort: low  # none | minimal | low
+```
+
+`lean_chat_fast_path` recognizes only clear short conversation and feedback. On
+the first model request it omits tool schemas, sets `tool_choice: none`, and
+lowers supported reasoning-effort fields. Explicit actions, live-state checks,
+attachments, code/URLs, and ambiguous input fail closed to the normal operator
+lane. This prevents prompt guidance from being overridden by general tool-use
+instructions while preserving tools for actual work. The default is `false`.
+
 ## Tool-Use Enforcement
 
 Some models occasionally describe intended actions as text instead of making tool calls ("I would run the tests..." instead of actually calling the terminal). Tool-use enforcement injects system prompt guidance that steers the model back to actually calling tools.

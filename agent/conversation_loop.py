@@ -1563,6 +1563,16 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Resolve once per user turn. This is deliberately conservative and only
+    # affects the first model request; any explicit or ambiguous operator intent
+    # keeps the normal full-tool path.
+    from agent.lean_chat_router import should_use_lean_chat_fast_path
+
+    _lean_chat_turn = bool(
+        getattr(agent, "_lean_chat_fast_path", False)
+        and should_use_lean_chat_fast_path(original_user_message)
+    )
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -2115,7 +2125,7 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        tools_for_api = [] if (_lean_chat_turn and api_call_count == 1) else agent.tools
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2163,7 +2173,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -2512,6 +2522,13 @@ def run_conversation(
                     api_kwargs = agent._build_api_kwargs(
                         api_messages,
                         tools_for_api=tools_for_api,
+                    )
+                if _lean_chat_turn and api_call_count == 1:
+                    from agent.lean_chat_router import apply_lean_chat_request
+
+                    apply_lean_chat_request(
+                        api_kwargs,
+                        getattr(agent, "_lean_chat_reasoning_effort", "low"),
                     )
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —

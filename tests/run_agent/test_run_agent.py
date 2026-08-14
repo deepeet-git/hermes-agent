@@ -1036,6 +1036,32 @@ class TestBuildSystemPrompt:
         assert "Intent-aware response routing" not in prompt
         assert mock_skills.call_args.kwargs["intent_aware_routing"] is False
 
+    def test_lean_chat_runtime_routing_parses_config(self):
+        tools = _make_tool_defs("terminal", "web_search")
+        cfg = {
+            "agent": {
+                "lean_chat_fast_path": "true",
+                "lean_chat_reasoning_effort": "minimal",
+            }
+        }
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("hermes_cli.config.load_config", return_value=cfg),
+            patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert getattr(agent, "_lean_chat_fast_path") is True
+        assert getattr(agent, "_lean_chat_reasoning_effort") == "minimal"
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""
