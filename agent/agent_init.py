@@ -1820,6 +1820,23 @@ def init_agent(
     else:
         agent._intent_aware_routing = _intent_aware_raw is True
 
+    # Conservative runtime complement to prompt-only intent routing. Clear
+    # short conversation/feedback omits tool schemas for the first request and
+    # uses a lower reasoning effort; ambiguous input stays on the operator lane.
+    _lean_chat_raw = _agent_section.get("lean_chat_fast_path", False)
+    if isinstance(_lean_chat_raw, str):
+        agent._lean_chat_fast_path = (
+            _lean_chat_raw.strip().lower() in {"true", "1", "yes", "on"}
+        )
+    else:
+        agent._lean_chat_fast_path = _lean_chat_raw is True
+    _lean_effort = str(
+        _agent_section.get("lean_chat_reasoning_effort", "low") or "low"
+    ).strip().lower()
+    agent._lean_chat_reasoning_effort = (
+        _lean_effort if _lean_effort in {"none", "minimal", "low"} else "low"
+    )
+
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of
     # model-name substrings.  Resolved against the active api_mode/model in the
