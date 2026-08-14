@@ -423,6 +423,36 @@ class TestLoadGatewayConfig:
         assert extra["websocket_heartbeat_ack_max_age_seconds"] == 75
         assert extra["websocket_max_latency_seconds"] == 30
 
+    def test_discord_heimdall_incident_intake_seeds_platform_extra(self, tmp_path, monkeypatch):
+        heimdall_incident_intake = {
+            "guild_id": "100000000000000001",
+            "channel_id": "100000000000000002",
+            "webhook_id": "100000000000000004",
+            "author_id": "100000000000000003",
+            "toolsets": ["safe"],
+        }
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "discord:\n"
+            "  heimdall_incident_intake:\n"
+            "    guild_id: '100000000000000001'\n"
+            "    channel_id: '100000000000000002'\n"
+            "    webhook_id: '100000000000000004'\n"
+            "    author_id: '100000000000000003'\n"
+            "    toolsets:\n"
+            "      - safe\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert (
+            config.platforms[Platform.DISCORD].extra["heimdall_incident_intake"]
+            == heimdall_incident_intake
+        )
+
     def test_session_reset_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.session_reset`` (nested form) must reach default_reset_policy,
         mirroring the gateway.multiplex_profiles precedent."""
