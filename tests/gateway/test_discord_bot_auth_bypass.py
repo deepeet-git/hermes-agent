@@ -14,6 +14,7 @@ DISCORD_ALLOW_BOTS permits it AND no user allowlist entry exists.
 """
 
 from types import SimpleNamespace
+import weakref
 
 import pytest
 
@@ -96,6 +97,27 @@ def test_discord_bot_authorized_when_allow_bots_mentions(monkeypatch):
 
     source = _make_discord_bot_source(bot_id="999888777")
     assert runner._is_user_authorized(source) is True
+
+
+def test_trusted_heimdall_source_bypasses_generic_bot_policy_only_with_native_transport(monkeypatch):
+    """The second gateway auth gate preserves the adapter's verified intake."""
+    runner = _make_bare_runner()
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "none")
+    source = _make_discord_bot_source()
+    setattr(source, "_trusted_heimdall_incident", True)
+    transport = type("NativeDiscordTransport", (), {"platform": Platform.DISCORD})()
+    setattr(source, "_transport_adapter_ref", weakref.ref(transport))
+
+    assert runner._is_user_authorized(source) is True
+
+    wrong_platform_transport = type(
+        "WrongPlatformTransport", (), {"platform": Platform.TELEGRAM}
+    )()
+    setattr(source, "_transport_adapter_ref", weakref.ref(wrong_platform_transport))
+    assert runner._is_user_authorized(source) is False
+
+    delattr(source, "_transport_adapter_ref")
+    assert runner._is_user_authorized(source) is False
 
 
 def test_bot_bypass_does_not_leak_to_other_platforms(monkeypatch):

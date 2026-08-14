@@ -586,6 +586,28 @@ class GatewayAuthorizationMixin:
 
         user_id = source.user_id
 
+        # The Discord adapter stamps this marker only after its exact
+        # guild/channel/webhook/author and embed-only intake check. Keep the
+        # gateway's second gate from undoing that decision when generic bot
+        # admission is disabled, but require the same non-serializable native
+        # transport proof used by principal toolset resolution.
+        if (
+            source.platform == Platform.DISCORD
+            and getattr(source, "_trusted_heimdall_incident", False)
+        ):
+            adapter_ref = getattr(source, "_transport_adapter_ref", None)
+            try:
+                adapter = adapter_ref() if callable(adapter_ref) else None
+            except Exception:
+                adapter = None
+            if (
+                adapter is not None
+                and getattr(adapter, "platform", None) == Platform.DISCORD
+                and not source.delivered_via_upstream_relay
+            ):
+                return True
+            return False
+
         # Once a Discord principal policy is configured it is authoritative for
         # non-DM intake. Do not fall through to legacy env allow-all/user lists.
         if source.platform == Platform.DISCORD and source.chat_type != "dm":

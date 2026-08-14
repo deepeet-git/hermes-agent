@@ -24,10 +24,21 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 from collections import defaultdict
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
+from pathlib import Path, Path as _Path
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows
+    msvcrt = None
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
@@ -74,6 +85,42 @@ _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.json"
+_DISCORD_HEIMDALL_INCIDENT_STATE_FILENAME = "discord_heimdall_incidents.json"
+_DISCORD_SNOWFLAKE_MAX = (1 << 64) - 1
+_DISCORD_SNOWFLAKE_RE = re.compile(r"[1-9][0-9]{16,19}\Z")
+_HEIMDALL_INCIDENT_CLAIM_LOCKS: weakref.WeakKeyDictionary[Any, dict[tuple[str, str, str], asyncio.Lock]] = weakref.WeakKeyDictionary()
+_HEIMDALL_INCIDENT_CLAIM_LOCKS_LOCK = threading.Lock()
+_HEIMDALL_INCIDENT_ID_FIELD = "incident id"
+_HEIMDALL_OCCURRENCE_FIELD_NAMES = frozenset({"발생 횟수", "연속 실패"})
+_HEIMDALL_OCCURRENCE_DESCRIPTION_LINE_RE = re.compile(r"^\s*발생\s+횟수\s*:\s*.*$", re.IGNORECASE)
+_HEIMDALL_INCIDENT_ID_MAX_LENGTH = 256
+
+
+def _heimdall_incident_claim_lock(
+    state_path: Path, fingerprint: str, scope: dict[str, str],
+) -> asyncio.Lock:
+    """Return the process-global claim lock for this running event loop.
+
+    ``asyncio.Lock`` instances are loop-affine once contested. Keeping their
+    registry weakly keyed by loop lets adapters share one lock in a loop while
+    preventing a closed loop from poisoning a later gateway/test loop.
+    """
+    loop = asyncio.get_running_loop()
+    key = (
+        str(state_path.resolve()),
+        fingerprint,
+        json.dumps(scope, sort_keys=True, separators=(",", ":")),
+    )
+    with _HEIMDALL_INCIDENT_CLAIM_LOCKS_LOCK:
+        locks = _HEIMDALL_INCIDENT_CLAIM_LOCKS.get(loop)
+        if locks is None:
+            locks = {}
+            _HEIMDALL_INCIDENT_CLAIM_LOCKS[loop] = locks
+        lock = locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[key] = lock
+        return lock
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
@@ -119,6 +166,178 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
     ),
     re.compile(r"^\s*♻️?\s+Gateway\s+(?:restarted successfully|online\b)[\s\S]*$", re.IGNORECASE),
 )
+
+
+class HeimdallIncidentThreadStore:
+    """Profile-local, bounded durable mapping for open Heimdall incidents."""
+
+    _MAX_INCIDENTS = 100
+    _VERSION = 1
+    _SCOPE_KEYS = ("guild_id", "channel_id", "webhook_id")
+
+    def __init__(self, state_path: Path, *, now: Callable[[], float] = time.time) -> None:
+        self._path = state_path
+        self._now = now
+        self._corrupt = False
+        self._incidents: list[dict[str, Any]] = self._load()
+
+    @classmethod
+    def default(cls) -> "HeimdallIncidentThreadStore":
+        from hermes_constants import get_hermes_home
+
+        return cls(get_hermes_home() / "gateway" / _DISCORD_HEIMDALL_INCIDENT_STATE_FILENAME)
+
+    @classmethod
+    def _valid_scope(cls, scope: Any) -> bool:
+        return isinstance(scope, dict) and all(
+            isinstance(scope.get(key), str) and scope[key] for key in cls._SCOPE_KEYS
+        )
+
+    @classmethod
+    def _valid_incident(cls, incident: Any) -> bool:
+        return (
+            isinstance(incident, dict)
+            and isinstance(incident.get("fingerprint"), str)
+            and bool(incident["fingerprint"])
+            and cls._valid_scope(incident.get("scope"))
+            and isinstance(incident.get("thread_id"), str)
+            and bool(incident["thread_id"])
+            and incident.get("lifecycle") in {"open", "resolved"}
+            and isinstance(incident.get("updated_at"), (int, float))
+            and math.isfinite(incident["updated_at"])
+        )
+
+    def _load(self) -> list[dict[str, Any]]:
+        if not self._path.exists():
+            return []
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            incidents = data.get("incidents") if isinstance(data, dict) else None
+            if (
+                data.get("version") != self._VERSION
+                or not isinstance(incidents, list)
+                or len(incidents) > self._MAX_INCIDENTS
+                or not all(self._valid_incident(incident) for incident in incidents)
+            ):
+                raise ValueError("invalid Heimdall incident state")
+            return incidents
+        except Exception as exc:
+            self._corrupt = True
+            logger.warning("Refusing corrupt Heimdall incident state %s: %s", self._path, exc)
+            return []
+
+    @staticmethod
+    def _matches(incident: dict[str, Any], fingerprint: str, scope: dict[str, str]) -> bool:
+        return incident["fingerprint"] == fingerprint and incident["scope"] == scope
+
+    def get(self, fingerprint: str, scope: dict[str, str]) -> Optional[dict[str, Any]]:
+        if self._corrupt or not self._valid_scope(scope):
+            return None
+        for incident in self._incidents:
+            if self._matches(incident, fingerprint, scope) and incident["lifecycle"] == "open":
+                return dict(incident)
+        return None
+
+    def reread(self) -> bool:
+        """Refresh state while an incident claim is held by this process."""
+        if self._corrupt:
+            return False
+        self._incidents = self._load()
+        return not self._corrupt
+
+    def _acquire_claim_file_lock(self, claim_key: str) -> Optional[Any]:
+        """Open and acquire the per-incident cross-process lock off-loop."""
+        handle = None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = self._path.with_name(f".{self._path.name}.{claim_key}.lock")
+            handle = lock_path.open("a+", encoding="utf-8")
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+            else:  # pragma: no cover - unsupported platforms
+                logger.warning("No process-shared Heimdall incident lock is available")
+                handle.close()
+                return None
+            return handle
+        except Exception as exc:
+            logger.warning("Could not claim Heimdall incident state %s: %s", self._path, exc)
+            if handle is not None:
+                handle.close()
+            return None
+
+    @staticmethod
+    def _release_claim_file_lock(handle: Any) -> None:
+        """Release and close a cross-process claim lock off-loop."""
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+        finally:
+            handle.close()
+
+    @asynccontextmanager
+    async def claim(self, fingerprint: str, scope: dict[str, str]):
+        """Claim one fingerprint and scope across adapters and processes."""
+        if self._corrupt or not fingerprint or not self._valid_scope(scope):
+            yield False
+            return
+        claim_key = hashlib.sha256(json.dumps(
+            {"fingerprint": fingerprint, "scope": scope}, sort_keys=True,
+        ).encode("utf-8")).hexdigest()
+        handle = await asyncio.to_thread(self._acquire_claim_file_lock, claim_key)
+        if handle is None:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                await asyncio.to_thread(self._release_claim_file_lock, handle)
+            except Exception as exc:
+                logger.warning("Could not release Heimdall incident state %s: %s", self._path, exc)
+
+    @property
+    def is_healthy(self) -> bool:
+        """Whether the durable state was loaded without a validation failure."""
+        return not self._corrupt
+
+    def _write(self, incidents: list[dict[str, Any]]) -> bool:
+        if self._corrupt:
+            return False
+        try:
+            atomic_json_write(self._path, {"version": self._VERSION, "incidents": incidents})
+        except Exception as exc:
+            logger.warning("Could not persist Heimdall incident state %s: %s", self._path, exc)
+            return False
+        self._incidents = incidents
+        return True
+
+    def remember(self, fingerprint: str, scope: dict[str, str], thread_id: str) -> bool:
+        if self._corrupt or not fingerprint or not self._valid_scope(scope) or not thread_id:
+            return False
+        incidents = [incident for incident in self._incidents if not self._matches(incident, fingerprint, scope)]
+        incidents.append({
+            "fingerprint": fingerprint,
+            "scope": dict(scope),
+            "thread_id": str(thread_id),
+            "lifecycle": "open",
+            "updated_at": self._now(),
+        })
+        incidents = sorted(incidents, key=lambda incident: incident["updated_at"])[-self._MAX_INCIDENTS:]
+        return self._write(incidents)
+
+    def forget(self, fingerprint: str, scope: dict[str, str]) -> bool:
+        if self._corrupt or not self._valid_scope(scope):
+            return False
+        return self._write([
+            incident for incident in self._incidents
+            if not self._matches(incident, fingerprint, scope)
+        ])
+
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
@@ -132,7 +351,6 @@ except ImportError:
     commands = None
 
 import sys
-from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 try:
@@ -1004,6 +1222,9 @@ class DiscordAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    # Trusted webhook alert text is deliberately smaller than a Discord
+    # message. It becomes agent input, so keep it bounded before any routing.
+    _HEIMDALL_ALERT_TEXT_MAX = 4_000
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
@@ -1108,6 +1329,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
+        # Persistent, profile-local fingerprint -> thread state for trusted
+        # webhook alerts.  It is verified against Discord before each reuse.
+        self._heimdall_incident_store = HeimdallIncidentThreadStore.default()
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1450,6 +1674,24 @@ class DiscordAdapter(BasePlatformAdapter):
 
         role_authorized = False
         if getattr(message.author, "bot", False):
+            heimdall_configured = isinstance(
+                getattr(self.config, "extra", {}).get("heimdall_incident_intake"), dict
+            )
+            heimdall_admitted, heimdall_text, heimdall_fingerprint = (
+                self._heimdall_incident_admission(message)
+            )
+            if heimdall_admitted:
+                # These values are generated only after every trusted transport
+                # identity check succeeds. They are not derived from message text.
+                setattr(message, "_heimdall_incident_text", heimdall_text)
+                setattr(message, "_heimdall_incident_fingerprint", heimdall_fingerprint)
+            elif heimdall_configured and self._heimdall_channel_matches(message):
+                # A configured incident channel is not a generic bot channel:
+                # reject all near-matches rather than falling through to the
+                # global DISCORD_ALLOW_BOTS policy.
+                return False, False
+            if heimdall_admitted:
+                return True, False
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
@@ -1503,6 +1745,221 @@ class DiscordAdapter(BasePlatformAdapter):
                     return False, False
 
         return True, role_authorized
+
+    def _heimdall_incident_config(self) -> Optional[dict]:
+        """Return the opt-in trusted Heimdall intake policy, if well-formed."""
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        config = extra.get("heimdall_incident_intake") if isinstance(extra, dict) else None
+        if not isinstance(config, dict):
+            return None
+        required = ("guild_id", "channel_id", "webhook_id", "author_id")
+        if set(config) != {*required, "toolsets"}:
+            return None
+        if not all(self._is_canonical_discord_snowflake(config.get(key)) for key in required):
+            return None
+        toolsets = config.get("toolsets")
+        if not isinstance(toolsets, list) or not toolsets or not all(
+            isinstance(toolset, str) and toolset.strip() for toolset in toolsets
+        ):
+            return None
+        return config
+
+    @staticmethod
+    def _is_canonical_discord_snowflake(value: Any) -> bool:
+        """Accept only canonical unsigned Discord snowflake strings."""
+        return (
+            isinstance(value, str)
+            and bool(_DISCORD_SNOWFLAKE_RE.fullmatch(value))
+            and int(value) <= _DISCORD_SNOWFLAKE_MAX
+        )
+
+    def _heimdall_channel_matches(self, message: Any) -> bool:
+        """Whether an event reaches the configured incident guild and channel."""
+        config = self._heimdall_incident_config()
+        if config is None:
+            return False
+        return (
+            str(getattr(getattr(message, "guild", None), "id", "")) == str(config["guild_id"])
+            and str(getattr(getattr(message, "channel", None), "id", "")) == str(config["channel_id"])
+        )
+
+    @staticmethod
+    def _sanitize_heimdall_alert_text(value: Any) -> str:
+        text = str(value or "")
+        text = "".join(char for char in text if char >= " " or char in "\n\t")
+        return re.sub(r"[ \t]+", " ", text).strip()
+
+    def _normalize_heimdall_embed_text(self, embeds: Any) -> str:
+        """Extract bounded, non-markup alert text from Discord embeds only."""
+        parts: list[str] = []
+        for embed in embeds or []:
+            for value in (getattr(embed, "title", None), getattr(embed, "description", None)):
+                clean = self._sanitize_heimdall_alert_text(value)
+                if clean:
+                    parts.append(clean)
+            for field in getattr(embed, "fields", []) or []:
+                for value in (getattr(field, "name", None), getattr(field, "value", None)):
+                    clean = self._sanitize_heimdall_alert_text(value)
+                    if clean:
+                        parts.append(clean)
+        return "\n".join(parts)[:self._HEIMDALL_ALERT_TEXT_MAX].strip()
+
+    @classmethod
+    def _heimdall_incident_fingerprint_for_embeds(cls, embeds: Any) -> Optional[str]:
+        """Return a stable ID fingerprint or the narrow legacy evidence fallback.
+
+        Webhook fields are untrusted.  A single bounded ``Incident ID`` field is
+        the only structured identity accepted; duplicate or malformed identity
+        fields are ambiguous and therefore denied by returning ``None``.  Older
+        alerts without that field retain every normalized piece of evidence
+        except the explicitly volatile occurrence-count forms.
+        """
+        incident_ids: list[str] = []
+        legacy_parts: list[str] = []
+        for embed in embeds or []:
+            title = cls._sanitize_heimdall_alert_text(getattr(embed, "title", None))
+            if title:
+                legacy_parts.append(title)
+            description = cls._sanitize_heimdall_alert_text(getattr(embed, "description", None))
+            if description:
+                description = "\n".join(
+                    line for line in description.splitlines()
+                    if not _HEIMDALL_OCCURRENCE_DESCRIPTION_LINE_RE.fullmatch(line)
+                ).strip()
+                if description:
+                    legacy_parts.append(description)
+            for field in getattr(embed, "fields", []) or []:
+                name = cls._sanitize_heimdall_alert_text(getattr(field, "name", None))
+                value = cls._sanitize_heimdall_alert_text(getattr(field, "value", None))
+                normalized_name = re.sub(r"\s+", " ", name).casefold()
+                if normalized_name == _HEIMDALL_INCIDENT_ID_FIELD:
+                    incident_id = re.sub(r"\s+", " ", value).strip()
+                    if not incident_id or len(incident_id) > _HEIMDALL_INCIDENT_ID_MAX_LENGTH:
+                        return None
+                    incident_ids.append(incident_id)
+                    continue
+                if normalized_name in _HEIMDALL_OCCURRENCE_FIELD_NAMES:
+                    continue
+                if name:
+                    legacy_parts.append(name)
+                if value:
+                    legacy_parts.append(value)
+        if incident_ids:
+            if len(incident_ids) != 1:
+                return None
+            return cls._heimdall_alert_fingerprint(f"incident-id:{incident_ids[0]}")
+        legacy_text = "\n".join(legacy_parts)[:cls._HEIMDALL_ALERT_TEXT_MAX].strip()
+        return cls._heimdall_alert_fingerprint(legacy_text) if legacy_text else None
+
+    @staticmethod
+    def _format_heimdall_evidence(text: str) -> str:
+        """Label webhook-controlled embed text as evidence, never instructions."""
+        return f"[Untrusted Discord webhook alert evidence]\n{text}"
+
+    @staticmethod
+    def _heimdall_alert_fingerprint(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _heimdall_incident_admission(self, message: Any) -> tuple[bool, str, str]:
+        """Fail closed for one exact, embed-only trusted webhook principal."""
+        store = getattr(self, "_heimdall_incident_store", None)
+        if store is not None and not getattr(store, "is_healthy", False):
+            return False, "", ""
+        config = self._heimdall_incident_config()
+        if config is None or not self._heimdall_channel_matches(message):
+            return False, "", ""
+        if (
+            str(getattr(message, "webhook_id", "")) != str(config["webhook_id"])
+            or str(getattr(getattr(message, "author", None), "id", "")) != str(config["author_id"])
+            or bool(getattr(message, "content", "").strip())
+            or bool(getattr(message, "attachments", []))
+        ):
+            return False, "", ""
+        embeds = getattr(message, "embeds", [])
+        text = self._normalize_heimdall_embed_text(embeds)
+        fingerprint = self._heimdall_incident_fingerprint_for_embeds(embeds)
+        if not text or fingerprint is None:
+            return False, "", ""
+        return True, text, fingerprint
+
+    def _heimdall_incident_scope(self) -> Optional[dict[str, str]]:
+        """Return the exact persisted routing scope for a valid intake policy."""
+        config = self._heimdall_incident_config()
+        if config is None:
+            return None
+        return {
+            "guild_id": str(config["guild_id"]),
+            "channel_id": str(config["channel_id"]),
+            "webhook_id": str(config["webhook_id"]),
+        }
+
+    async def _resolve_heimdall_incident_thread(
+        self, fingerprint: str, message: Any,
+    ) -> Optional[Any]:
+        """Fetch and validate a persisted incident thread before reusing it."""
+        scope = self._heimdall_incident_scope()
+        if not fingerprint or scope is None:
+            return None
+        incident = self._heimdall_incident_store.get(fingerprint, scope)
+        if incident is None:
+            return None
+        try:
+            # Do not trust an adapter cache across a gateway restart: fetch the
+            # current Discord object and check its parent and guild again.
+            if self._client is None:
+                raise RuntimeError("Discord client unavailable")
+            thread = await self._client.fetch_channel(int(incident["thread_id"]))
+            if (
+                thread is None
+                or str(getattr(thread, "parent_id", "")) != scope["channel_id"]
+                or str(getattr(getattr(thread, "guild", None), "id", "")) != scope["guild_id"]
+            ):
+                raise ValueError("missing or wrong-parent incident thread")
+            return thread
+        except Exception as exc:
+            logger.warning("Discarding stale Heimdall incident thread %s: %s", incident["thread_id"], exc)
+            self._heimdall_incident_store.forget(fingerprint, scope)
+            return None
+
+    async def _get_or_create_heimdall_incident_thread(
+        self,
+        fingerprint: str,
+        message: Any,
+        create_thread: Callable[[], Any],
+    ) -> Optional[Any]:
+        """Atomically claim one incident-thread creation per fingerprint."""
+        scope = self._heimdall_incident_scope()
+        store = getattr(self, "_heimdall_incident_store", None)
+        if (
+            not fingerprint
+            or scope is None
+            or store is None
+            or not getattr(store, "is_healthy", False)
+        ):
+            return None
+        claim_lock = _heimdall_incident_claim_lock(store._path, fingerprint, scope)
+        async with claim_lock:
+            async with store.claim(fingerprint, scope) as claimed:
+                if not claimed or not store.reread():
+                    return None
+                existing = await self._resolve_heimdall_incident_thread(fingerprint, message)
+                if existing is not None:
+                    self._threads.mark(str(existing.id))
+                    return existing
+                if not store.is_healthy:
+                    return None
+                thread = await create_thread()
+                if thread is None:
+                    return None
+                if not store.remember(fingerprint, scope, str(thread.id)):
+                    logger.warning("Refusing unpersisted Heimdall incident thread")
+                    return None
+                self._threads.mark(str(thread.id))
+                # Match generic auto-thread handling: Discord can emit the
+                # new thread's starter message as a second default event with
+                # message.id == thread.id.
+                self._dedup.is_duplicate(str(thread.id))
+                return thread
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
@@ -7777,10 +8234,18 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
         is_voice_linked_channel = False
+        channel_keys: set[str] = set()
+        is_free_channel = False
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
-        raw_content = message.content.strip()
+        heimdall_text = getattr(message, "_heimdall_incident_text", None)
+        heimdall_fingerprint = getattr(message, "_heimdall_incident_fingerprint", None)
+        raw_content = (
+            self._format_heimdall_evidence(str(heimdall_text))
+            if heimdall_text is not None
+            else str(message.content)
+        ).strip()
         normalized_content = raw_content
         mention_prefix = False
 
@@ -7854,6 +8319,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not is_free_channel
                 and not is_threaded_response_channel
                 and not in_bot_thread
+                # Exact embed-only Heimdall events receive these paired values
+                # only from _discord_message_admission after its full trusted
+                # webhook identity check. Do not use any channel-wide waiver.
+                and not (
+                    isinstance(heimdall_text, str)
+                    and isinstance(heimdall_fingerprint, str)
+                    and bool(heimdall_fingerprint)
+                )
             ):
                 if not self._self_is_explicitly_mentioned(message) and not mention_prefix:
                     return False
@@ -7862,6 +8335,23 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
+        if heimdall_fingerprint and not is_thread:
+            no_thread_channels = self._get_no_thread_channels()
+            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
+            if skip_thread or not auto_thread or is_voice_linked_channel:
+                logger.warning("Refusing Heimdall intake without a dedicated incident thread")
+                return False
+            auto_threaded_channel = await self._get_or_create_heimdall_incident_thread(
+                heimdall_fingerprint,
+                message,
+                lambda: self._auto_create_thread(message),
+            )
+            if auto_threaded_channel is None:
+                return False
+            parent_channel_id = str(message.channel.id)
+            is_thread = True
+            thread_id = str(auto_threaded_channel.id)
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
@@ -7990,6 +8480,11 @@ class DiscordAdapter(BasePlatformAdapter):
             "_validated_parent_chat_id",
             parent_channel_id if is_thread else None,
         )
+        if heimdall_fingerprint:
+            # Gateway toolset resolution additionally requires an in-process
+            # adapter reference, so this marker cannot confer authority on a
+            # relayed or serialized SessionSource.
+            setattr(source, "_trusted_heimdall_incident", True)
 
         # Build media URLs -- download image attachments to local cache so the
         # vision tool can access them reliably (Discord CDN URLs can expire).

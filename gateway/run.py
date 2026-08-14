@@ -3309,7 +3309,7 @@ def _resolve_principal_enabled_toolsets(
         feature_enabled = policy_present
     platform_key = _platform_config_key(source.platform)
     validated_parent_chat_id = None
-    if feature_enabled:
+    if feature_enabled or getattr(source, "_trusted_heimdall_incident", False):
         # Relay payloads do not currently carry an authenticated underlying
         # Discord principal. Never interpret serialized relay metadata as
         # native Discord authority.
@@ -3345,6 +3345,22 @@ def _resolve_principal_enabled_toolsets(
             if not trusted_native_source:
                 logger.warning("Principal toolset policy denied unverified Discord source")
                 return []
+            if getattr(source, "_trusted_heimdall_incident", False):
+                intake = (
+                    discord_config.get("heimdall_incident_intake")
+                    if isinstance(discord_config, dict) else None
+                )
+                toolsets = intake.get("toolsets") if isinstance(intake, dict) else None
+                if not isinstance(toolsets, list) or not toolsets or not all(
+                    isinstance(name, str) and name and validate_toolset(name)
+                    for name in toolsets
+                ):
+                    logger.warning("Trusted Heimdall source denied malformed explicit toolset clamp")
+                    return []
+                # Bot principals never inherit owner capabilities. This exact
+                # source receives only the explicit allowlist from its intake
+                # policy, intersected with the platform's active toolsets.
+                return sorted(set(toolsets) & set(platform_toolsets))
 
     decision = apply_principal_toolset_policy(
         feature_enabled=feature_enabled,
@@ -3391,6 +3407,10 @@ def _principal_context_is_restricted(
 
     if source.platform not in {Platform.DISCORD, Platform.RELAY}:
         return False
+    if getattr(source, "_trusted_heimdall_incident", False):
+        # This principal is always explicit and must never inherit private
+        # owner context, even when its explicit tools equal the platform list.
+        return True
     if sorted(enabled_toolsets) != sorted(platform_toolsets):
         return True
     if source.platform == Platform.RELAY or not isinstance(user_config, dict):

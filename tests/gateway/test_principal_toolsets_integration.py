@@ -72,6 +72,44 @@ def test_serialized_discord_source_without_live_transport_fails_closed(monkeypat
     assert actual == []
 
 
+def test_trusted_heimdall_bot_uses_only_its_explicit_toolset_clamp(monkeypatch) -> None:
+    """The native intake marker cannot inherit owner tools or private context."""
+    monkeypatch.delenv("HERMES_DISCORD_PRINCIPAL_TOOLSETS_ENABLED", raising=False)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="incident-thread",
+        parent_chat_id="error-alert",
+        thread_id="incident-thread",
+        chat_type="thread",
+        user_id="trusted-webhook-author",
+        scope_id="guild",
+        is_bot=True,
+    )
+    transport = _stamp_native_discord(source)
+    setattr(source, "_validated_parent_chat_id", "error-alert")
+    setattr(source, "_trusted_heimdall_incident", True)
+    config = {
+        "discord": {
+            "heimdall_incident_intake": {"toolsets": ["safe", "terminal"]},
+        }
+    }
+
+    actual = _resolve_principal_enabled_toolsets(
+        user_config=config,
+        source=source,
+        platform_toolsets=["safe", "terminal", "web"],
+    )
+
+    assert actual == ["safe", "terminal"]
+    assert _principal_context_is_restricted(
+        source=source,
+        platform_toolsets=["safe", "terminal"],
+        enabled_toolsets=actual,
+        user_config=config,
+    ) is True
+    assert transport.platform == Platform.DISCORD
+
+
 def test_unnormalized_relay_source_fails_closed_when_feature_enabled(monkeypatch) -> None:
     monkeypatch.setenv("HERMES_DISCORD_PRINCIPAL_TOOLSETS_ENABLED", "true")
     source = SessionSource(
