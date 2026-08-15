@@ -7377,7 +7377,12 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_name = thread_name[:77] + "..."
         return thread_name
 
-    async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
+    async def _auto_create_thread(
+        self,
+        message: 'DiscordMessage',
+        *,
+        name_source: Optional[str] = None,
+    ) -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
         Returns the created thread object, or ``None`` on failure. Both the
@@ -7386,7 +7391,9 @@ class DiscordAdapter(BasePlatformAdapter):
         (e.g. ``Cannot connect to host discord.com:443``) don't immediately
         burn through to the caller's failure path (#20243).
         """
-        thread_name = self._derive_auto_thread_name(message.content or "")
+        thread_name = self._derive_auto_thread_name(
+            name_source if name_source is not None else message.content or ""
+        )
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
         reason = f"Auto-threaded from mention by {display_name}"
 
@@ -8357,7 +8364,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_threaded_channel = await self._get_or_create_heimdall_incident_thread(
                 heimdall_fingerprint,
                 message,
-                lambda: self._auto_create_thread(message),
+                lambda: self._auto_create_thread(message, name_source=heimdall_text),
             )
             if auto_threaded_channel is None:
                 return False
