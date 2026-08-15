@@ -1659,18 +1659,18 @@ class DiscordAdapter(BasePlatformAdapter):
         message: Any,
         *,
         claim: bool,
-    ) -> tuple[bool, bool]:
-        """Return ``(admitted, role_authorized)`` for one Discord event."""
+    ) -> tuple[bool, bool, Optional[str], Optional[str]]:
+        """Return admission, role authority, and trusted Heimdall metadata."""
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
-                return False, False
+                return False, False, None, None
         elif self._dedup.contains(message_id):
-            return False, False
+            return False, False, None, None
         if message.author == self._client.user:
-            return False, False
+            return False, False, None, None
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
-            return False, False
+            return False, False, None, None
 
         role_authorized = False
         if getattr(message.author, "bot", False):
@@ -1680,28 +1680,26 @@ class DiscordAdapter(BasePlatformAdapter):
             heimdall_admitted, heimdall_text, heimdall_fingerprint = (
                 self._heimdall_incident_admission(message)
             )
-            if heimdall_admitted:
-                # These values are generated only after every trusted transport
-                # identity check succeeds. They are not derived from message text.
-                setattr(message, "_heimdall_incident_text", heimdall_text)
-                setattr(message, "_heimdall_incident_fingerprint", heimdall_fingerprint)
-            elif heimdall_configured and self._heimdall_channel_matches(message):
+            if not heimdall_admitted and heimdall_configured and self._heimdall_channel_matches(message):
                 # A configured incident channel is not a generic bot channel:
                 # reject all near-matches rather than falling through to the
                 # global DISCORD_ALLOW_BOTS policy.
-                return False, False
+                return False, False, None, None
             if heimdall_admitted:
-                return True, False
+                # Return trusted transport-derived metadata alongside the
+                # admission result. discord.Message is slots-based and cannot
+                # safely carry arbitrary adapter attributes.
+                return True, False, heimdall_text, heimdall_fingerprint
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
-                return False, False
+                return False, False, None, None
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
-                return False, False
+                return False, False, None, None
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
             ):
-                return False, False
+                return False, False, None, None
         else:
             msg_guild = getattr(message, "guild", None)
             is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
@@ -1719,7 +1717,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel_ids=msg_channel_ids,
             ):
                 self._warn_if_fail_closed_default()
-                return False, False
+                return False, False, None, None
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
         raw_self_mention = self._self_is_explicitly_mentioned(message)
@@ -1731,7 +1729,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 for mentioned in message.mentions
             )
             if other_bots_mentioned and not raw_self_mention:
-                return False, False
+                return False, False, None, None
             ignore_no_mention = os.getenv(
                 "DISCORD_IGNORE_NO_MENTION", "true"
             ).lower() in {"true", "1", "yes"}
@@ -1742,9 +1740,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 free_channels = self._discord_free_response_channels()
                 channel_keys = self._discord_channel_keys(message, parent_id)
                 if "*" not in free_channels and not (channel_keys & free_channels):
-                    return False, False
+                    return False, False, None, None
 
-        return True, role_authorized
+        return True, role_authorized, None, None
 
     def _heimdall_incident_config(self) -> Optional[dict]:
         """Return the opt-in trusted Heimdall intake policy, if well-formed."""
@@ -1968,14 +1966,19 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
-        admitted, role_authorized = self._discord_message_admission(
+        admitted, role_authorized, heimdall_text, heimdall_fingerprint = self._discord_message_admission(
             message, claim=True,
         )
         if not admitted:
             return False
-        return await self._handle_message(
-            message, role_authorized=role_authorized,
-        )
+        if heimdall_fingerprint:
+            return await self._handle_message(
+                message,
+                role_authorized=role_authorized,
+                heimdall_text=heimdall_text,
+                heimdall_fingerprint=heimdall_fingerprint,
+            )
+        return await self._handle_message(message, role_authorized=role_authorized)
 
     async def _cancel_bot_task(self) -> None:
         """Cancel and await the background client.start() task, if running."""
@@ -2766,6 +2769,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _dispatch_recovered_message(self, message: Any) -> bool:
         """Run one recovered message through the live Discord ingress gates."""
+        admitted, role_authorized, heimdall_text, heimdall_fingerprint = self._discord_message_admission(
+            message, claim=False,
+        )
+        if not admitted:
+            return False
         if not isinstance(message.channel, discord.DMChannel):
             parent_id = self._get_parent_channel_id(message.channel)
             channel_keys = self._discord_channel_keys(message, parent_id)
@@ -2781,13 +2789,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not (channel_keys & free_channels)
                 and not in_bot_thread
                 and not self._self_is_explicitly_mentioned(message)
+                and not heimdall_fingerprint
             ):
                 return False
-        admitted, role_authorized = self._discord_message_admission(
-            message, claim=False,
-        )
-        if not admitted:
-            return False
+        if heimdall_fingerprint:
+            return await self._handle_message(
+                message,
+                role_authorized=role_authorized,
+                recovered=True,
+                heimdall_text=heimdall_text,
+                heimdall_fingerprint=heimdall_fingerprint,
+            )
         return await self._handle_message(
             message,
             role_authorized=role_authorized,
@@ -8211,6 +8223,8 @@ class DiscordAdapter(BasePlatformAdapter):
         role_authorized: bool = False,
         *,
         recovered: bool = False,
+        heimdall_text: Optional[str] = None,
+        heimdall_fingerprint: Optional[str] = None,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
         # In server channels (not DMs), require the bot to be @mentioned
@@ -8239,8 +8253,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
-        heimdall_text = getattr(message, "_heimdall_incident_text", None)
-        heimdall_fingerprint = getattr(message, "_heimdall_incident_fingerprint", None)
         raw_content = (
             self._format_heimdall_evidence(str(heimdall_text))
             if heimdall_text is not None
