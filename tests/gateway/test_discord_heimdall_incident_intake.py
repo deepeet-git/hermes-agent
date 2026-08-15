@@ -152,6 +152,9 @@ async def test_heimdall_embed_only_alert_reaches_handler_through_required_mentio
     assert await adapter._dispatch_discord_message(first) is True
     assert await adapter._dispatch_discord_message(event(102)) is True
     assert adapter._auto_create_thread.await_count == 1
+    assert adapter._auto_create_thread.await_args.kwargs["name_source"] == (
+        "Database alert\ndatabase unhealthy\nIncident ID\ndatabase-primary"
+    )
     assert adapter.handle_message.await_count == 2
     dispatched = [call.args[0] for call in adapter.handle_message.await_args_list]
     assert [item.source.chat_id for item in dispatched] == [str(created_thread.id)] * 2
