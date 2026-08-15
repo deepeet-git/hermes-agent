@@ -172,6 +172,88 @@ async def test_heimdall_embed_only_alert_reaches_handler_through_required_mentio
     assert adapter.handle_message.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_heimdall_intake_does_not_mutate_slots_based_discord_message(
+    tmp_path: Path, monkeypatch,
+):
+    """Production discord.Message objects reject arbitrary adapter attributes."""
+    class SlotsMessage:
+        __slots__ = (
+            "id", "guild", "channel", "author", "webhook_id", "content",
+            "attachments", "embeds", "mentions", "reference", "created_at", "type",
+        )
+
+    class ParentChannel:
+        def __init__(self):
+            self.id = 100000000000000002
+            self.name = "heimdall-alerts"
+            self.guild = SimpleNamespace(id=100000000000000001, name="Hermes")
+            self.topic = None
+
+    class IncidentThread:
+        def __init__(self):
+            self.id = 100000000000000005
+            self.name = "incident"
+            self.parent_id = 100000000000000002
+            self.parent = ParentChannel()
+            self.guild = self.parent.guild
+            self.topic = None
+
+    monkeypatch.setattr(discord_platform.discord, "Thread", IncidentThread, raising=False)
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    for name in (
+        "DISCORD_FREE_RESPONSE_CHANNELS", "DISCORD_THREADED_RESPONSE_CHANNELS",
+        "DISCORD_ALLOW_BOTS", "DISCORD_NO_THREAD_CHANNELS",
+        "DISCORD_ALLOWED_CHANNELS", "DISCORD_IGNORED_CHANNELS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test"))
+    adapter.config.extra = {"heimdall_incident_intake": _config()}
+    adapter._heimdall_incident_store = HeimdallIncidentThreadStore(
+        tmp_path / "discord_heimdall_incidents.json"
+    )
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        fetch_channel=lambda _thread_id: _async_value(IncidentThread()),
+    )
+    adapter._ready_event.set()
+    adapter._text_batch_delay_seconds = 0
+    adapter._auto_create_thread = AsyncMock(return_value=IncidentThread())
+    adapter.handle_message = AsyncMock()
+
+    message = SlotsMessage()
+    message.id = 201
+    message.guild = ParentChannel().guild
+    message.channel = ParentChannel()
+    message.author = SimpleNamespace(
+        id=100000000000000003, bot=True, display_name="Heimdall", name="Heimdall",
+    )
+    message.webhook_id = 100000000000000004
+    message.content = ""
+    message.attachments = []
+    message.embeds = [SimpleNamespace(
+        title="Database alert", description="database unhealthy",
+        fields=[SimpleNamespace(name="Incident ID", value="database-primary")],
+    )]
+    message.mentions = []
+    message.reference = None
+    message.created_at = datetime.now(timezone.utc)
+    message.type = discord_platform.discord.MessageType.default
+
+    assert await adapter._dispatch_discord_message(message) is True
+    assert adapter.handle_message.await_count == 1
+
+    recovered = SlotsMessage()
+    for slot in SlotsMessage.__slots__:
+        setattr(recovered, slot, getattr(message, slot))
+    recovered.id = 202
+
+    assert await adapter._dispatch_recovered_message(recovered) is True
+    assert adapter.handle_message.await_count == 2
+
+
 def test_heimdall_embed_text_is_sanitized_bounded_and_fingerprinted_stably():
     adapter = _adapter(_config())
     message = _alert(embeds=[SimpleNamespace(
