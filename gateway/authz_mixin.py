@@ -143,6 +143,11 @@ class GatewayAuthorizationMixin:
         default = list(platform_toolsets)
         if source.platform != Platform.DISCORD:
             return default
+        if getattr(source, "_trusted_heimdall_incident", False):
+            # The dedicated intake resolver has already required native transport
+            # proof and applied its explicit toolset clamp. Do not erase that
+            # bot-only grant with human principal channel rules.
+            return default
 
         adapter, configured, policy = self._principal_policy_context(source)
         if not configured:

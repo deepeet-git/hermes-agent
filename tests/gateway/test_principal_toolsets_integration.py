@@ -1,6 +1,8 @@
+import logging
 import weakref
 
 from gateway.run import (
+    GatewayRunner,
     _principal_context_is_restricted,
     _resolve_principal_enabled_toolsets,
 )
@@ -72,8 +74,11 @@ def test_serialized_discord_source_without_live_transport_fails_closed(monkeypat
     assert actual == []
 
 
-def test_trusted_heimdall_bot_uses_only_its_explicit_toolset_clamp(monkeypatch) -> None:
+def test_trusted_heimdall_bot_uses_only_its_explicit_toolset_clamp(
+    monkeypatch, caplog
+) -> None:
     """The native intake marker cannot inherit owner tools or private context."""
+    caplog.set_level(logging.INFO, logger="gateway.run")
     monkeypatch.delenv("HERMES_DISCORD_PRINCIPAL_TOOLSETS_ENABLED", raising=False)
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -101,6 +106,8 @@ def test_trusted_heimdall_bot_uses_only_its_explicit_toolset_clamp(monkeypatch) 
     )
 
     assert actual == ["safe", "terminal"]
+    assert "Trusted Heimdall toolset clamp" in caplog.text
+    assert "safe,terminal" in caplog.text
     assert _principal_context_is_restricted(
         source=source,
         platform_toolsets=["safe", "terminal"],
@@ -108,6 +115,43 @@ def test_trusted_heimdall_bot_uses_only_its_explicit_toolset_clamp(monkeypatch) 
         user_config=config,
     ) is True
     assert transport.platform == Platform.DISCORD
+
+
+def test_forged_heimdall_marker_still_has_no_effective_tools(monkeypatch) -> None:
+    """Bypassing the generic human gate cannot bypass native intake verification."""
+    monkeypatch.setenv("HERMES_DISCORD_PRINCIPAL_TOOLSETS_ENABLED", "true")
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="incident-thread",
+        parent_chat_id="error-alert",
+        thread_id="incident-thread",
+        chat_type="thread",
+        user_id="spoofed-webhook-author",
+        scope_id="guild",
+        is_bot=True,
+    )
+    setattr(source, "_trusted_heimdall_incident", True)
+    setattr(source, "_validated_parent_chat_id", "error-alert")
+    config = {
+        "discord": {
+            "principal_toolsets": {},
+            "heimdall_incident_intake": {"toolsets": ["terminal", "web"]},
+        }
+    }
+    platform_toolsets = ["terminal", "web"]
+
+    policy_toolsets = _resolve_principal_enabled_toolsets(
+        user_config=config,
+        source=source,
+        platform_toolsets=platform_toolsets,
+    )
+    generic_ceiling = object.__new__(GatewayRunner)._principal_effective_toolsets(
+        source,
+        platform_toolsets,
+    )
+
+    assert policy_toolsets == []
+    assert [name for name in policy_toolsets if name in set(generic_ceiling)] == []
 
 
 def test_unnormalized_relay_source_fails_closed_when_feature_enabled(monkeypatch) -> None:

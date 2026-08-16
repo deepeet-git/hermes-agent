@@ -3360,7 +3360,13 @@ def _resolve_principal_enabled_toolsets(
                 # Bot principals never inherit owner capabilities. This exact
                 # source receives only the explicit allowlist from its intake
                 # policy, intersected with the platform's active toolsets.
-                return sorted(set(toolsets) & set(platform_toolsets))
+                resolved = sorted(set(toolsets) & set(platform_toolsets))
+                logger.info(
+                    "Trusted Heimdall toolset clamp channel=%s toolsets=%s",
+                    validated_parent_chat_id or source.chat_id,
+                    ",".join(resolved),
+                )
+                return resolved
 
     decision = apply_principal_toolset_policy(
         feature_enabled=feature_enabled,

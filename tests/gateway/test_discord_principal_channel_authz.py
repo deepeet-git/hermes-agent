@@ -55,6 +55,29 @@ def _policy():
     }
 
 
+def test_trusted_heimdall_intake_is_not_erased_by_generic_principal_toolsets():
+    """The dedicated verified intake clamp, not a human channel rule, is authoritative."""
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="incident-thread",
+        parent_chat_id="error-alert",
+        thread_id="incident-thread",
+        chat_type="thread",
+        user_id="trusted-webhook-author",
+        scope_id="guild-1",
+        is_bot=True,
+    )
+    setattr(source, "_trusted_heimdall_incident", True)
+
+    platform_toolsets = ["terminal", "file", "delegation", "web"]
+    effective = _runner(_policy())._principal_effective_toolsets(
+        source,
+        platform_toolsets,
+    )
+
+    assert effective == platform_toolsets
+
+
 def test_discord_channel_principal_allowlist_authorizes_regular_user(monkeypatch):
     _clear_auth_env(monkeypatch)
     source = SessionSource(
