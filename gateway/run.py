@@ -735,6 +735,12 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
         return ""
 
+    # Empty interrupted turns are repaired with this transcript placeholder so
+    # provider role alternation remains valid. It is transport metadata, not a
+    # user-facing reply, and must never leak onto human chat surfaces.
+    if str(text).strip().casefold() == "[response interrupted]":
+        return ""
+
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)

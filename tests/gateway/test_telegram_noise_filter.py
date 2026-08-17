@@ -255,6 +255,15 @@ def test_chat_gateways_drop_interrupt_sentinel(platform):
     assert _sanitize_gateway_final_response("local", sentinel) == sentinel
 
 
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_chat_gateways_drop_response_interrupted_placeholder(platform):
+    """Transcript repair metadata must never become a user-visible chat reply."""
+    placeholder = "[response interrupted]"
+
+    assert _sanitize_gateway_final_response(platform, placeholder) == ""
+    assert _sanitize_gateway_final_response("local", placeholder) == placeholder
+
+
 def test_telegram_status_sanitizes_raw_provider_security_errors():
     """Provider policy/security bodies should be replaced before chat delivery."""
     raw = (

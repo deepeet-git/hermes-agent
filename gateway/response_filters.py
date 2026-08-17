@@ -18,6 +18,7 @@ SILENT_REPLY_TOKEN = "NO_REPLY"
 # error/empty-response path, not silence.
 LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "[SILENT]",
+    "[RESPONSE INTERRUPTED]",
     "SILENT",
     "NO_REPLY",
     "NO REPLY",
