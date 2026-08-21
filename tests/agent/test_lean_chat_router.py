@@ -37,6 +37,24 @@ def test_keeps_live_state_and_ambiguous_input_on_operator_lane():
         assert not should_use_lean_chat_fast_path(message)
 
 
+def test_keeps_mutable_source_questions_on_operator_lane():
+    for message in (
+        "pdp creator 규칙이 변경됐을텐데 한글기반으로 말이야. 기존 폴더명도 수정가능한가?",
+        "저장소 최신 규칙상 이 파일을 바꿀 수 있어?",
+        "현재 코드에서는 기존 경로를 계속 쓰나요?",
+    ):
+        assert not should_use_lean_chat_fast_path(message)
+
+
+def test_keeps_tool_availability_questions_on_operator_lane():
+    for message in (
+        "이 대화에서 저장소를 조회할 도구가 연결돼 있어?",
+        "DB 접근 가능해?",
+        "로그를 직접 읽을 수 있나요?",
+    ):
+        assert not should_use_lean_chat_fast_path(message)
+
+
 def test_apply_lean_chat_request_removes_tools_and_lowers_reasoning():
     kwargs = {
         "model": "gpt-5.6-sol",

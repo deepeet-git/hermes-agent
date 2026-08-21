@@ -38,6 +38,18 @@ _LIVE_STATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MUTABLE_SOURCE_RE = re.compile(
+    r"(?=.*(?:규칙|계약|저장소|리포지토리|repo(?:sitory)?|코드|파일|폴더|경로|설정))"
+    r"(?=.*(?:변경됐|바뀌었|달라졌|최신|기존|현재))",
+    re.IGNORECASE,
+)
+
+_TOOL_CAPABILITY_RE = re.compile(
+    r"(?=.*(?:도구|툴|저장소|리포지토리|repo(?:sitory)?|DB|데이터베이스|로그|서버|API|파일|코드))"
+    r"(?=.*(?:가능|접근|연결|조회|확인|검색|읽|수정|변경|쓸\s*수|사용))",
+    re.IGNORECASE,
+)
+
 _CONVERSATIONAL_RE = re.compile(
     r"(?:"
     r"안\s*되네|안되네|느리네|여전하|그대로네|맞네|맞아|아니네|아니야|"
@@ -78,6 +90,8 @@ def should_use_lean_chat_fast_path(message: Any) -> bool:
     if _CONVERSATIONAL_RE.search(text):
         return True
     if _LIVE_STATE_RE.search(text):
+        return False
+    if _MUTABLE_SOURCE_RE.search(text) or _TOOL_CAPABILITY_RE.search(text):
         return False
     return bool(text.endswith("?") and len(text) <= 120)
 
