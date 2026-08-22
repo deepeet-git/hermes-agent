@@ -512,6 +512,51 @@ memory:
             "target_uri": ["viking://resources/deepeet/cortex/current"],
         }]
 
+    def test_current_state_prefetch_uses_exact_authority_fallback_first(self, monkeypatch):
+        query = "현재 Git 최신화와 OpenViking 즉시 동기화 계약"
+        scope = "viking://resources/deepeet/cortex/current"
+        exact_uri = f"{scope}/CURRENT/recent-decisions.md"
+        responses = {
+            ("/api/v1/search/search", "memory", query, "session-test"): {
+                "result": {"memories": [], "resources": []}
+            },
+            ("/api/v1/search/find", "resource", query): {
+                "result": {"memories": [], "resources": [{
+                    "uri": f"{scope}/GAP_ANALYSIS/.abstract.md",
+                    "score": 0.99,
+                    "level": 0,
+                    "abstract": "generic current gap summary",
+                }]}
+            },
+            ("/api/v1/search/grep", None, None): {
+                "result": {"matches": [{
+                    "uri": exact_uri,
+                    "line": 3,
+                    "content": "D-0157 Git 최신화는 OpenViking 즉시 동기화까지 하나의 폐쇄 루프로 끝낸다",
+                }]}
+            },
+        }
+        provider = make_prefetch_provider(
+            monkeypatch,
+            responses,
+            OPENVIKING_RECALL_AUTHORITY_SCOPES=scope,
+        )
+
+        block = wait_prefetch(provider, query=query)
+
+        assert block.index(exact_uri) < block.index(f"{scope}/GAP_ANALYSIS/.abstract.md")
+        grep_calls = [
+            payload for method, path, payload in FakeRecallClient.calls
+            if method == "post" and path == "/api/v1/search/grep"
+        ]
+        assert grep_calls == [{
+            "uri": scope,
+            "pattern": "OpenViking",
+            "case_insensitive": True,
+            "node_limit": 24,
+            "level_limit": 10,
+        }]
+
 
 class TestOpenVikingTurnConversion:
     def test_extract_current_turn_anchors_on_latest_matching_user_and_assistant(self):

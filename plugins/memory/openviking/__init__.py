@@ -3023,6 +3023,42 @@ class OpenVikingMemoryProvider(MemoryProvider):
             timeout=timeout,
         )
 
+    @staticmethod
+    def _authority_exact_pattern(query: str) -> str:
+        stop = {
+            "canonical", "current", "currently", "latest", "now", "status", "today",
+            "계약", "무엇인가", "상태", "오늘", "정본", "지금", "최신", "현재", "현황",
+        }
+        candidates = re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{3,}|[가-힣]{4,}", query)
+        candidates = [candidate for candidate in candidates if candidate.lower() not in stop]
+        return max(candidates, key=len, default="")
+
+    @staticmethod
+    def _post_authority_grep(
+        client: _VikingClient,
+        pattern: str,
+        authority_scope: str,
+        *,
+        limit: int,
+        deadline: float,
+        request_timeout: float,
+    ) -> dict:
+        timeout = OpenVikingMemoryProvider._remaining_recall_timeout(
+            deadline,
+            request_timeout,
+        )
+        return client.post(
+            "/api/v1/search/grep",
+            {
+                "uri": authority_scope,
+                "pattern": pattern,
+                "case_insensitive": True,
+                "node_limit": limit,
+                "level_limit": 10,
+            },
+            timeout=timeout,
+        )
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """OpenViking recall is current-query only; post-turn warming is unused."""
         return
@@ -3608,6 +3644,37 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     for item in authority_result.get("resources", []) or []:
                         if isinstance(item, dict):
                             candidates.append(item)
+
+                exact_pattern = self._authority_exact_pattern(query_text)
+                if exact_pattern:
+                    for authority_scope in authority_scopes:
+                        try:
+                            exact_resp = self._post_authority_grep(
+                                client,
+                                exact_pattern,
+                                authority_scope,
+                                limit=candidate_limit,
+                                deadline=deadline,
+                                request_timeout=cfg["request_timeout_seconds"],
+                            )
+                        except Exception as e:
+                            logger.debug("OpenViking authority exact fallback failed: %s", e)
+                            continue
+                        exact_result = self._unwrap_result(exact_resp)
+                        if not isinstance(exact_result, dict):
+                            continue
+                        for match in exact_result.get("matches", []) or []:
+                            if not isinstance(match, dict):
+                                continue
+                            candidate = dict(match)
+                            candidate.update(
+                                category="resource",
+                                level=2,
+                                score=1.0,
+                                abstract=str(match.get("content") or "").strip(),
+                                _authority_exact=True,
+                            )
+                            candidates.append(candidate)
 
             selected = self._select_recall_candidates(
                 candidates,
@@ -4195,7 +4262,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return rank
         uri = str(item.get("uri") or "")
         if cls._authority_scope(uri, authority_scopes):
-            rank += 0.5
+            rank += 1.0 if item.get("_authority_exact") else 0.5
+            if item.get("level") == 2 and not item.get("_authority_exact"):
+                rank -= 0.12
         elif "/events/" in uri.lower() or "/cases/" in uri.lower():
             rank -= 0.3
         return rank
@@ -4307,10 +4376,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         read_state = {"full_reads": 0}
         scopes = authority_scopes or []
         for item in items:
+            uri = str(item.get("uri") or "")
+            is_current_authority = bool(self._authority_scope(uri, scopes))
             content = self._resolve_recall_content(
                 client,
                 item,
-                prefer_abstract=prefer_abstract,
+                prefer_abstract=prefer_abstract or is_current_authority,
                 deadline=deadline,
                 request_timeout=request_timeout,
                 read_state=read_state,
@@ -4318,8 +4389,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             )
             if not content:
                 continue
-            uri = str(item.get("uri") or "")
-            if self._authority_scope(uri, scopes):
+            if is_current_authority:
                 authority = "canonical-current"
             elif "/events/" in uri.lower() or "/cases/" in uri.lower():
                 authority = "historical-memory"
