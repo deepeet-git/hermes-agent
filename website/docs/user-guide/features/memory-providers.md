@@ -327,6 +327,18 @@ live in `ovcli.conf` (`OPENVIKING_CLI_CONFIG_FILE` or
 - Tiered context loading: L0 (~100 tokens) → L1 (~2k) → L2 (full)
 - Automatic memory extraction on session commit (profile, preferences, entities, events, cases, patterns)
 - `viking://` URI scheme for hierarchical knowledge browsing
+- Optional `memory.openviking.recall_authority_scopes` list. Current-state queries search these resource prefixes and rank matching canonical resources above historical event/case memories.
+
+```yaml
+memory:
+  openviking:
+    recall_authority_scopes:
+      - viking://resources/acme/current
+```
+
+Automatic recall is reference evidence, not automatic current authority. For
+current or time-sensitive claims, verify the original source; historical memory
+may be stale or superseded.
 
 `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` are used for local/trusted mode.
 `OPENVIKING_AGENT` is Hermes' peer ID in OpenViking for peer-scoped memories.

@@ -112,6 +112,7 @@ def make_prefetch_provider(monkeypatch, responses, **env):
         "OPENVIKING_RECALL_FULL_READ_LIMIT",
         "OPENVIKING_RECALL_PREFER_ABSTRACT",
         "OPENVIKING_RECALL_RESOURCES",
+        "OPENVIKING_RECALL_AUTHORITY_SCOPES",
         "OPENVIKING_PROFILE_TOKEN_BUDGET",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -295,6 +296,7 @@ class TestOpenVikingConfigSchema:
             "full_read_limit": 2,
             "prefer_abstract": False,
             "resources": False,
+            "authority_scopes": [],
         }
 
     def test_recall_config_reads_from_config_yaml(self, monkeypatch, tmp_path):
@@ -456,6 +458,59 @@ memory:
 
         assert cfg["limit"] == 4
         assert cfg["resources"] is True
+
+    def test_current_state_prefetch_prioritizes_configured_authority_scope(self, monkeypatch):
+        query = "현재 수동 최신화 계약은 무엇인가"
+        canonical_uri = "viking://resources/deepeet/cortex/current/DECISIONS/sync.md"
+        stale_uri = "viking://user/default/memories/events/old-sync.md"
+        responses = {
+            ("/api/v1/search/search", "memory", query, "session-test"): {
+                "result": {
+                    "memories": [{
+                        "uri": stale_uri,
+                        "score": 0.95,
+                        "level": 1,
+                        "category": "events",
+                        "abstract": "수동 최신화는 다음 새벽에 반영된다.",
+                    }],
+                    "resources": [],
+                }
+            },
+            ("/api/v1/search/find", "resource", query): {
+                "result": {
+                    "memories": [],
+                    "resources": [{
+                        "uri": canonical_uri,
+                        "score": 0.55,
+                        "level": 1,
+                        "category": "resource",
+                        "abstract": "수동 최신화 성공 직후 OpenViking까지 즉시 반영한다.",
+                    }],
+                }
+            },
+        }
+        provider = make_prefetch_provider(
+            monkeypatch,
+            responses,
+            OPENVIKING_RECALL_AUTHORITY_SCOPES="viking://resources/deepeet/cortex/current",
+        )
+
+        block = wait_prefetch(provider, query=query)
+
+        assert block.index(canonical_uri) < block.index(stale_uri)
+        assert "<authority>canonical-current</authority>" in block
+        assert "<authority>historical-memory</authority>" in block
+        authority_calls = [
+            payload for method, path, payload in FakeRecallClient.calls
+            if method == "post" and path == "/api/v1/search/find"
+        ]
+        assert authority_calls == [{
+            "query": query,
+            "limit": 24,
+            "score_threshold": 0,
+            "context_type": "resource",
+            "target_uri": ["viking://resources/deepeet/cortex/current"],
+        }]
 
 
 class TestOpenVikingTurnConversion:

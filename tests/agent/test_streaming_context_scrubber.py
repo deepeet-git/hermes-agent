@@ -182,3 +182,13 @@ class TestBuildMemoryContextBlockWarnsOnViolation:
 
         assert not any("pre-wrapped" in rec.message for rec in caplog.records)
         assert "plain fact about user" in out
+
+    def test_memory_context_is_evidence_not_automatic_current_authority(self):
+        from agent.memory_manager import build_memory_context_block
+
+        out = build_memory_context_block("an older operational claim")
+
+        assert "reference evidence" in out
+        assert "not automatic current authority" in out
+        assert "verify the original current source" in out
+        assert "authoritative reference data" not in out

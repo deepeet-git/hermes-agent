@@ -74,10 +74,27 @@ profile's `.env`:
 | `OPENVIKING_ACCOUNT` | `default` | Tenant account for local/trusted mode |
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
 | `OPENVIKING_AGENT` | `hermes` | Hermes peer ID in OpenViking, used for peer-scoped memories |
+| `OPENVIKING_RECALL_AUTHORITY_SCOPES` | (none) | Comma-separated current-authority `viking://resources/...` prefixes searched for current-state queries |
 
 When `OPENVIKING_API_KEY` is set, Hermes lets OpenViking derive account/user
 identity from the key. In local or trusted deployments without an API key,
 Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
+
+For repositories that contain a current source of truth, configure authority
+scopes in `config.yaml`:
+
+```yaml
+memory:
+  openviking:
+    recall_authority_scopes:
+      - viking://resources/acme/current
+```
+
+On queries containing current-state intent (for example `current`, `latest`,
+`status`, or their supported Korean equivalents), Hermes performs an additional
+scoped resource search, labels those results `canonical-current`, and ranks them
+above event/case memories. Recalled memories remain evidence: they are not
+automatically authoritative for current state and may have been superseded.
 
 ## Tools
 

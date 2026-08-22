@@ -2369,6 +2369,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "default": False,
                 "env_var": "OPENVIKING_RECALL_RESOURCES",
             },
+            {
+                "key": "recall_authority_scopes",
+                "description": (
+                    "Current-authority viking:// resource prefixes. On current-state queries, "
+                    "Hermes searches these scopes and ranks matching resources above historical memory."
+                ),
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "env_var": "OPENVIKING_RECALL_AUTHORITY_SCOPES",
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -2882,6 +2893,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "including extracted facts, entities, events, and resources.\n"
                 "Use viking_search for extracted memories, facts, entities, "
                 "events, and resources.\n"
+                "Treat recalled memory as historical evidence, not automatic current authority. "
+                "For current-state claims, prefer entries labeled canonical-current and verify "
+                "their original resource when the decision is material.\n"
                 "For questions about remembered people, preferences, projects, "
                 "events, or prior user context, search OpenViking before asking "
                 "the user to repeat context.\n"
@@ -2982,6 +2996,32 @@ class OpenVikingMemoryProvider(MemoryProvider):
             request_timeout,
         )
         return client.post("/api/v1/search/find", base_payload, timeout=timeout)
+
+    @staticmethod
+    def _post_authority_search(
+        client: _VikingClient,
+        query: str,
+        authority_scopes: List[str],
+        *,
+        limit: int,
+        deadline: float,
+        request_timeout: float,
+    ) -> dict:
+        timeout = OpenVikingMemoryProvider._remaining_recall_timeout(
+            deadline,
+            request_timeout,
+        )
+        return client.post(
+            "/api/v1/search/find",
+            {
+                "query": query,
+                "limit": limit,
+                "score_threshold": 0,
+                "context_type": "resource",
+                "target_uri": authority_scopes,
+            },
+            timeout=timeout,
+        )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """OpenViking recall is current-query only; post-turn warming is unused."""
@@ -3552,11 +3592,30 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     if isinstance(item, dict):
                         candidates.append(item)
 
+            current_state_query = self._is_current_state_query(query_text)
+            authority_scopes = cfg["authority_scopes"]
+            if current_state_query and authority_scopes:
+                authority_resp = self._post_authority_search(
+                    client,
+                    query_text,
+                    authority_scopes,
+                    limit=candidate_limit,
+                    deadline=deadline,
+                    request_timeout=cfg["request_timeout_seconds"],
+                )
+                authority_result = self._unwrap_result(authority_resp)
+                if isinstance(authority_result, dict):
+                    for item in authority_result.get("resources", []) or []:
+                        if isinstance(item, dict):
+                            candidates.append(item)
+
             selected = self._select_recall_candidates(
                 candidates,
                 query_text,
                 limit=cfg["limit"],
                 score_threshold=cfg["score_threshold"],
+                authority_scopes=authority_scopes,
+                current_state_query=current_state_query,
             )
             parts = self._build_prefetch_entries(
                 client,
@@ -3566,6 +3625,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 deadline=deadline,
                 request_timeout=cfg["request_timeout_seconds"],
                 full_read_limit=cfg["full_read_limit"],
+                authority_scopes=authority_scopes,
             )
             return "\n".join(parts)
         except Exception as e:
@@ -3654,6 +3714,29 @@ class OpenVikingMemoryProvider(MemoryProvider):
             parsed = default
         return max(minimum, min(maximum, parsed))
 
+    @classmethod
+    def _setting_uri_prefixes(cls, env_name: str, config_value: Any) -> List[str]:
+        value, source = cls._setting_value(env_name, config_value)
+        if value in (None, "", []):
+            return []
+        if isinstance(value, str):
+            raw_values = value.split(",")
+        elif isinstance(value, (list, tuple)):
+            raw_values = value
+        else:
+            cls._warn_invalid_setting_once(source, value, [])
+            return []
+
+        prefixes: List[str] = []
+        for raw in raw_values:
+            prefix = str(raw or "").strip().rstrip("/")
+            if not prefix.startswith("viking://resources/"):
+                cls._warn_invalid_setting_once(source, raw, [])
+                continue
+            if prefix not in prefixes:
+                prefixes.append(prefix)
+        return prefixes
+
     def _recall_config(self) -> Dict[str, Any]:
         # Read from config.yaml → memory.openviking as primary source, env vars
         # as override. Behavioural settings belong in config.yaml (AGENTS.md).
@@ -3706,6 +3789,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "OPENVIKING_RECALL_RESOURCES",
                 cfg.get("recall_resources", False),
                 default=False,
+            ),
+            "authority_scopes": self._setting_uri_prefixes(
+                "OPENVIKING_RECALL_AUTHORITY_SCOPES",
+                cfg.get("recall_authority_scopes", []),
             ),
         }
 
@@ -4073,6 +4160,46 @@ class OpenVikingMemoryProvider(MemoryProvider):
         leaf_boost = 0.12 if item.get("level") == 2 else 0.0
         return cls._clamp_score(item.get("score")) + leaf_boost + overlap_boost
 
+    @staticmethod
+    def _is_current_state_query(query: str) -> bool:
+        lowered = query.lower()
+        ascii_words = set(re.findall(r"[a-z0-9]+", lowered))
+        if ascii_words & {
+            "current", "currently", "latest", "now", "today", "status", "canonical",
+        }:
+            return True
+        return any(
+            token in lowered
+            for token in ("현재", "최신", "지금", "오늘", "정본", "현황", "상태")
+        )
+
+    @staticmethod
+    def _authority_scope(uri: str, authority_scopes: List[str]) -> str:
+        normalized = uri.rstrip("/")
+        for scope in authority_scopes:
+            if normalized == scope or normalized.startswith(scope + "/"):
+                return scope
+        return ""
+
+    @classmethod
+    def _authority_aware_rank(
+        cls,
+        item: Dict[str, Any],
+        query_tokens: List[str],
+        *,
+        authority_scopes: List[str],
+        current_state_query: bool,
+    ) -> float:
+        rank = cls._recall_rank(item, query_tokens)
+        if not current_state_query:
+            return rank
+        uri = str(item.get("uri") or "")
+        if cls._authority_scope(uri, authority_scopes):
+            rank += 0.5
+        elif "/events/" in uri.lower() or "/cases/" in uri.lower():
+            rank -= 0.3
+        return rank
+
     @classmethod
     def _select_recall_candidates(
         cls,
@@ -4081,6 +4208,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         *,
         limit: int,
         score_threshold: float,
+        authority_scopes: Optional[List[str]] = None,
+        current_state_query: bool = False,
     ) -> List[Dict[str, Any]]:
         seen_uri = set()
         seen_key = set()
@@ -4099,7 +4228,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
             filtered.append(item)
 
         tokens = cls._query_tokens(query)
-        filtered.sort(key=lambda item: cls._recall_rank(item, tokens), reverse=True)
+        scopes = authority_scopes or []
+        filtered.sort(
+            key=lambda item: cls._authority_aware_rank(
+                item,
+                tokens,
+                authority_scopes=scopes,
+                current_state_query=current_state_query,
+            ),
+            reverse=True,
+        )
         return filtered[:limit]
 
     @staticmethod
@@ -4162,10 +4300,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         deadline: float,
         request_timeout: float,
         full_read_limit: int,
+        authority_scopes: Optional[List[str]] = None,
     ) -> List[str]:
         entries: List[str] = []
         total_chars = 0
         read_state = {"full_reads": 0}
+        scopes = authority_scopes or []
         for item in items:
             content = self._resolve_recall_content(
                 client,
@@ -4178,9 +4318,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
             )
             if not content:
                 continue
+            uri = str(item.get("uri") or "")
+            if self._authority_scope(uri, scopes):
+                authority = "canonical-current"
+            elif "/events/" in uri.lower() or "/cases/" in uri.lower():
+                authority = "historical-memory"
+            else:
+                authority = "reference"
             entry = "\n".join([
                 f"- [{self._recall_category(item)}]",
-                f"  <uri>{item.get('uri', '')}</uri>",
+                f"  <uri>{uri}</uri>",
+                f"  <authority>{authority}</authority>",
                 *[f"  {line}" for line in content.splitlines()],
             ])
             separator_chars = 1 if entries else 0
