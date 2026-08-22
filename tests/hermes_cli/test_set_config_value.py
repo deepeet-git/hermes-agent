@@ -493,6 +493,8 @@ class TestValidateConfigKey:
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
         "approvals.mode",
+        "memory.openviking.recall_authority_scopes",
+        "memory.honcho.base_url",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key
@@ -503,6 +505,7 @@ class TestValidateConfigKey:
         ("gateway.discord.gateway_restart_notification", None),  # no close suggestion
         ("disco", "discord"),
         ("agent.max_turn", "agent.max_turns"),
+        ("memory.openvikng.endpoint", None),
     ])
     def test_unknown_keys_with_suggestion(self, key, expected_in_suggestion):
         from hermes_cli.config import _validate_config_key

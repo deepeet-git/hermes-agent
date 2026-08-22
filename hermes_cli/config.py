@@ -4759,6 +4759,19 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
 # accepted because ``PlatformConfig`` carries an open ``extra`` mapping.
 _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 
+# Memory providers own their nested setup and behavioural schema. Keep the
+# provider name closed so typos such as ``memory.openvikng`` still warn, while
+# valid provider-specific settings remain configurable through the CLI.
+_MEMORY_PROVIDER_CONFIG_NAMES = frozenset({
+    "hindsight",
+    "holographic",
+    "honcho",
+    "mem0",
+    "openviking",
+    "retaindb",
+    "supermemory",
+})
+
 
 def _known_top_level_keys() -> set[str]:
     """Return the union of known top-level config keys for validation.
@@ -4855,6 +4868,10 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
         # shape themselves (mcp_servers.<name>.command, discord.<extras>,
         # providers.<name>.api_key, etc.).
         return True, None
+
+    if top == "memory" and len(segments) > 1:
+        if segments[1] in _MEMORY_PROVIDER_CONFIG_NAMES:
+            return True, None
 
     node: Any = DEFAULT_CONFIG.get(top)
     consumed = [top]
