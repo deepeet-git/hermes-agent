@@ -969,6 +969,12 @@ class VoiceReceiver:
         if self._dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+            if not user_id:
+                # Discord can omit the SPEAKING opcode when the user was
+                # already talking as the bot joined.  Waiting until silence
+                # detection to infer the sole allowed member is too late for
+                # DAVE: encrypted frames need the user id before Opus decode.
+                user_id = self._infer_user_for_ssrc(ssrc)
             if user_id:
                 try:
                     import davey
@@ -981,9 +987,8 @@ class VoiceReceiver:
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                         return
-            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
-            # Opus decode directly — audio may be in passthrough mode.
-            # Buffer will get a user_id when SPEAKING event arrives later.
+            # If SSRC is still unknown (for example multiple allowed users are
+            # present), skip DAVE and try Opus directly for passthrough mode.
 
         # --- Opus decode -> PCM ---
         try:

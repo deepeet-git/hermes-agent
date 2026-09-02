@@ -208,6 +208,30 @@ class TestRealNaClDecrypt:
 class TestRealNaClWithDAVE:
     """NaCl decrypt + DAVE passthrough scenarios with real crypto."""
 
+    def test_dave_unknown_ssrc_maps_sole_allowed_user_before_decrypt(self):
+        """Missing SPEAKING event still decrypts for the sole allowed member."""
+        key = _make_secret_key()
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+        ]
+        dave = MagicMock()
+        dave.decrypt.return_value = b'\xf8\xff\xfe'
+        receiver = _make_voice_receiver(
+            key,
+            dave_session=dave,
+            allowed_user_ids={"42"},
+            members=members,
+        )
+
+        packet = _build_encrypted_rtp_packet(key, b'\xf8\xff\xfe', ssrc=100)
+        receiver._on_packet(packet)
+
+        assert receiver._ssrc_to_user[100] == 42
+        assert dave.decrypt.call_args.args[0] == 42
+        assert 100 in receiver._buffers
+        assert len(receiver._buffers[100]) > 0
+
     def test_dave_unknown_ssrc_passthrough(self):
         """DAVE enabled but SSRC unknown → skip DAVE, buffer audio."""
         key = _make_secret_key()
