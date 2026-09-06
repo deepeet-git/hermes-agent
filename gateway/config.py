@@ -1588,6 +1588,15 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["principal_toolsets"] = platform_cfg["principal_toolsets"]
                 if plat == Platform.DISCORD and "heimdall_incident_intake" in platform_cfg:
                     bridged["heimdall_incident_intake"] = platform_cfg["heimdall_incident_intake"]
+                if plat == Platform.DISCORD:
+                    discord_extra = platform_cfg.get("extra", {})
+                    if not isinstance(discord_extra, dict):
+                        discord_extra = {}
+                    for key in ("voice_channel_text_output", "voice_channel_prompt"):
+                        if key in platform_cfg:
+                            bridged[key] = platform_cfg[key]
+                        elif key in discord_extra:
+                            bridged[key] = discord_extra[key]
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):

@@ -18845,6 +18845,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 await self._send_voice_reply(event, response)
 
+            # A live Discord voice channel can be configured as audio-only.
+            # Keep the normal session/transcript persistence above, but do not
+            # mirror the assistant's spoken reply into the linked text channel.
+            # ``already_sent=True`` bypasses the base-adapter voice-input dedup:
+            # returning None below means the base adapter will never receive the
+            # text response and therefore cannot perform its own TTS fallback.
+            if self._is_audio_only_discord_voice_event(event):
+                if (
+                    not _streaming_tts_done
+                    and self._should_send_voice_reply(
+                        event,
+                        response,
+                        agent_messages,
+                        already_sent=True,
+                    )
+                ):
+                    await self._send_voice_reply(event, response)
+                return None
+
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
             # sends raw text chunks that include MEDIA: tags — the normal
@@ -19734,6 +19753,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            if not self._voice_channel_text_output_enabled():
+                return ""
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
@@ -19763,6 +19784,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
+        if not self._voice_channel_text_output_enabled():
+            return ""
         return "Left voice channel."
 
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
@@ -19862,14 +19885,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        # Show transcript in text channel (after auth, with mention sanitization)
-        try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+        # Show transcript in the linked text channel only when both transcript
+        # echo and voice-channel text output are enabled. Audio-only voice
+        # conversations remain in session history without cluttering the chat.
+        if self._should_echo_stt_transcripts() and self._voice_channel_text_output_enabled():
+            try:
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                    await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+            except Exception:
+                pass
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
@@ -19885,6 +19911,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt = resolved if isinstance(resolved, str) else None
             except Exception:
                 channel_prompt = None
+        voice_prompt = self._discord_voice_channel_prompt()
+        if voice_prompt:
+            channel_prompt = "\n\n".join(
+                part for part in (channel_prompt, voice_prompt) if part
+            )
         event = MessageEvent(
             source=source,
             text=transcript,
@@ -19894,6 +19925,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         await adapter.handle_message(event)
+
+    def _discord_voice_channel_extra(self) -> Dict[str, Any]:
+        """Return behavioral settings from the configured Discord platform."""
+        try:
+            platform_config = self.config.platforms.get(Platform.DISCORD)
+            extra = getattr(platform_config, "extra", None)
+            return extra if isinstance(extra, dict) else {}
+        except Exception:
+            return {}
+
+    def _voice_channel_text_output_enabled(self) -> bool:
+        """Whether live Discord voice turns are mirrored into text chat."""
+        return bool(
+            self._discord_voice_channel_extra().get(
+                "voice_channel_text_output", True
+            )
+        )
+
+    def _discord_voice_channel_prompt(self) -> str:
+        """Return the optional live-voice conversational instruction."""
+        value = self._discord_voice_channel_extra().get("voice_channel_prompt", "")
+        return str(value).strip() if value is not None else ""
+
+    def _is_audio_only_discord_voice_event(self, event: MessageEvent) -> bool:
+        """Return True for connected Discord VC turns configured audio-only."""
+        if (
+            event.source.platform != Platform.DISCORD
+            or event.message_type != MessageType.VOICE
+            or self._voice_channel_text_output_enabled()
+        ):
+            return False
+        adapter = self.adapters.get(Platform.DISCORD)
+        guild_id = self._get_guild_id(event)
+        is_connected = getattr(adapter, "is_in_voice_channel", None)
+        return bool(
+            guild_id
+            and callable(is_connected)
+            and is_connected(guild_id)
+        )
 
     def _should_send_voice_reply(
         self,
@@ -19973,7 +20043,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
-        return bool(getattr(self.config, "stt_echo_transcripts", True))
+        return bool(
+            getattr(getattr(self, "config", None), "stt_echo_transcripts", True)
+        )
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""

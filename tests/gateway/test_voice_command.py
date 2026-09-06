@@ -648,6 +648,65 @@ class TestVoiceChannelCommands:
         event = mock_adapter.handle_message.call_args[0][0]
         assert event.channel_prompt == "Be terse in #dev."
 
+    @pytest.mark.asyncio
+    async def test_audio_only_input_suppresses_text_echo_and_adds_voice_prompt(self, runner):
+        """Audio-only Discord VC turns stay out of the linked text channel."""
+        from gateway.config import Platform
+
+        voice_prompt = "자연스러운 한국어 음성 대화를 한다."
+        runner.config = SimpleNamespace(
+            stt_echo_transcripts=False,
+            platforms={
+                Platform.DISCORD: SimpleNamespace(
+                    extra={
+                        "voice_channel_text_output": False,
+                        "voice_channel_prompt": voice_prompt,
+                    }
+                )
+            },
+        )
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        mock_adapter._resolve_channel_prompt = MagicMock(return_value="기존 채널 지침")
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "안녕하세요")
+
+        mock_channel.send.assert_not_awaited()
+        event = mock_adapter.handle_message.call_args.args[0]
+        assert event.channel_prompt == f"기존 채널 지침\n\n{voice_prompt}"
+
+    def test_audio_only_event_detects_connected_discord_voice_channel(self, runner):
+        from gateway.config import Platform
+
+        runner.config = SimpleNamespace(
+            platforms={
+                Platform.DISCORD: SimpleNamespace(
+                    extra={"voice_channel_text_output": False}
+                )
+            }
+        )
+        adapter = MagicMock()
+        adapter.is_in_voice_channel.return_value = True
+        runner.adapters[Platform.DISCORD] = adapter
+        event = MessageEvent(
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="123",
+                user_id="42",
+            ),
+            text="안녕하세요",
+            message_type=MessageType.VOICE,
+            raw_message=SimpleNamespace(guild_id=111, guild=None),
+        )
+
+        assert runner._is_audio_only_discord_voice_event(event) is True
+
 
     @pytest.mark.asyncio
     async def test_input_reuses_bound_source_metadata(self, runner):
