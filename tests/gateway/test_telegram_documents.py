@@ -153,6 +153,9 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio_cache"
     )
+    monkeypatch.setattr(
+        "gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "image_cache"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +184,25 @@ def _make_photo(file_obj=None):
 
 
 class TestDocumentDownloadBlock:
+
+    @pytest.mark.asyncio
+    async def test_svg_document_routes_to_vision_as_svg(self, adapter):
+        content = b'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"/>'
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name="deepeet.svg", mime_type="image/svg+xml",
+            file_size=len(content), file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+
+        await adapter._handle_media_message(_make_update(msg), MagicMock())
+        await asyncio.sleep(adapter.MEDIA_GROUP_WAIT_SECONDS + 0.05)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_types == ["image/svg+xml"]
+        assert event.media_urls[0].endswith(".svg")
 
 
     @pytest.mark.asyncio

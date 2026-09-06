@@ -12,6 +12,7 @@ in this environment.
 """
 
 import asyncio
+from pathlib import Path
 import socket
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -105,6 +106,17 @@ class TestCacheImageFromBytes:
         from gateway.platforms.base import cache_image_from_bytes
         with pytest.raises(ValueError, match="non-image data"):
             cache_image_from_bytes(b"<!DOCTYPE html><html><title>Slack</title></html>", ".png")
+
+    @pytest.mark.parametrize("data", [
+        b'<svg xmlns="http://www.w3.org/2000/svg"></svg>',
+        b'\xef\xbb\xbf  <?xml version="1.0"?>\n<SVG viewBox="0 0 1 1"/>',
+    ])
+    def test_caches_valid_svg(self, tmp_path, monkeypatch, data):
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        from gateway.platforms.base import cache_image_from_bytes
+        path = cache_image_from_bytes(data, ".svg")
+        assert path.endswith(".svg")
+        assert Path(path).read_bytes() == data
 
 
 # ---------------------------------------------------------------------------

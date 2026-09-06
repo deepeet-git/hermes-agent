@@ -835,7 +835,7 @@ def get_image_cache_dir() -> Path:
 
 
 def _looks_like_image(data: bytes) -> bool:
-    """Return True if *data* starts with a known image magic-byte sequence."""
+    """Return True if *data* looks like a supported raster image or SVG."""
     if len(data) < 4:
         return False
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -847,6 +847,19 @@ def _looks_like_image(data: bytes) -> bool:
     if data[:2] == b"BM":
         return True
     if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return True
+    # SVG is XML text and has no magic-byte signature.  Accept an optional
+    # UTF-8 BOM, leading whitespace, and XML declaration, but require the
+    # document element itself to be <svg so HTML/XML error pages still fail
+    # closed.  Vision call sites rasterize SVG before sending it to models.
+    prefix = data[:4096].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if prefix.startswith(b"<?xml"):
+        declaration_end = prefix.find(b"?>")
+        if declaration_end != -1:
+            prefix = prefix[declaration_end + 2 :].lstrip()
+    if prefix[:4].lower() == b"<svg" and (
+        len(prefix) == 4 or prefix[4:5] in b" \t\r\n>/"
+    ):
         return True
     return False
 
