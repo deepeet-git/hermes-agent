@@ -1,0 +1,3 @@
+name: codex-auth-recovery
+version: "1.0.0"
+description: Owner-only Telegram Codex OAuth recovery and terminal-auth alerts.
