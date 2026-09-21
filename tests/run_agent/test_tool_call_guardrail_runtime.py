@@ -373,6 +373,125 @@ def test_default_run_conversation_warns_without_guardrail_halt():
 
 
 
+def test_web_search_cap_allows_one_model_recovery_with_other_tools():
+    """An aggregate search cap should stop searches, not discard the task."""
+    config = {
+        "tool_loop_guardrails": {
+            "hard_stop_enabled": False,
+            "loop_caps": {"max_web_searches": 1},
+        }
+    }
+    agent = _make_agent("web_search", "write_file", max_iterations=10, config=config)
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "web_search", json.dumps({"query": "first"}), "c-search-ok"
+                )
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "web_search", json.dumps({"query": "over-limit"}), "c-search-block"
+                )
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "write_file",
+                    json.dumps({"path": "/tmp/report.md", "content": "report"}),
+                    "c-write",
+                )
+            ],
+        ),
+        _mock_response(content="report complete", finish_reason="stop", tool_calls=None),
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    def dispatch(name, args, task_id, **kwargs):
+        del args, task_id, kwargs
+        if name == "web_search":
+            return json.dumps({"results": ["official result"]})
+        if name == "write_file":
+            return json.dumps({"success": True})
+        raise AssertionError(name)
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("research and write a report")
+
+    assert [call.args[0] for call in mock_hfc.call_args_list] == [
+        "web_search",
+        "write_file",
+    ]
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "report complete"
+    blocked = [
+        m["content"]
+        for m in result["messages"]
+        if m.get("role") == "tool" and m.get("tool_call_id") == "c-search-block"
+    ]
+    assert len(blocked) == 1
+    assert "loop_web_search_cap" in blocked[0]
+
+
+def test_web_search_cap_halts_if_model_retries_after_recovery():
+    config = {
+        "tool_loop_guardrails": {
+            "hard_stop_enabled": False,
+            "loop_caps": {"max_web_searches": 1},
+        }
+    }
+    agent = _make_agent("web_search", max_iterations=10, config=config)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", json.dumps({"query": "first"}), "c1")
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", json.dumps({"query": "blocked"}), "c2")
+            ],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", json.dumps({"query": "retry"}), "c3")
+            ],
+        ),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"results": []})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search forever")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert "per-turn web search limit" in result["final_response"]
+    assert "repeated non-progressing" not in result["final_response"]
+
+
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     """Regression for #30770: when the guardrail halts the loop, the
     synthesized halt message must be pushed through ``stream_delta_callback``

@@ -209,6 +209,16 @@ class ToolGuardrailDecision:
     def should_halt(self) -> bool:
         return self.action in {"block", "halt"}
 
+    @property
+    def allows_recovery_iteration(self) -> bool:
+        """Whether the model gets one iteration to switch strategy.
+
+        Aggregate per-turn caps stop one tool category but need not discard the
+        whole task: the model can still synthesize existing evidence or use a
+        different tool. Repeated failures remain immediate hard stops.
+        """
+        return self.code in {"loop_web_search_cap", "loop_subagent_cap"}
+
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "action": self.action,

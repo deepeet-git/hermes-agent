@@ -7691,6 +7691,18 @@ class AIAgent:
 
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
+        if decision.code == "loop_web_search_cap":
+            return (
+                "I stopped this turn after reaching the per-turn web search limit "
+                "and then retrying web_search instead of switching strategy. "
+                "Existing results are preserved."
+            )
+        if decision.code == "loop_subagent_cap":
+            return (
+                "I stopped this turn after reaching the per-turn subagent limit "
+                "and then retrying delegate_task instead of switching strategy. "
+                "Existing results are preserved."
+            )
         return (
             f"I stopped retrying {tool} because it hit the tool-call guardrail "
             f"({decision.code}) after {decision.count} repeated non-progressing "

@@ -6812,6 +6812,24 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    recovery_codes = agent._tool_guardrail_recovery_codes_used
+                    if (
+                        decision.allows_recovery_iteration
+                        and decision.code not in recovery_codes
+                    ):
+                        # An aggregate cap should disable that runaway-prone
+                        # tool category without throwing away the whole task.
+                        # Give the model exactly one iteration to synthesize
+                        # existing results or switch tools. A retry of the
+                        # capped tool then follows the normal hard-stop path.
+                        recovery_codes.add(decision.code)
+                        agent._tool_guardrail_halt_decision = None
+                        agent._emit_status(
+                            f"⚠️ {decision.tool_name} limit reached; "
+                            "continuing with existing results and other tools"
+                        )
+                        continue
+
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(
