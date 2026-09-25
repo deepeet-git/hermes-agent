@@ -2079,3 +2079,34 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+def test_manual_codex_oauth_entries_keep_distinct_tokens_from_singleton(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {
+        "version": 1,
+        "providers": {"openai-codex": {"tokens": {
+            "access_token": "singleton-access",
+            "refresh_token": "singleton-refresh",
+        }}},
+        "credential_pool": {"openai-codex": [
+            {"id": "account-a", "label": "account-a", "auth_type": "oauth",
+             "priority": 0, "source": "manual:device_code",
+             "access_token": "account-a-access", "refresh_token": "account-a-refresh"},
+            {"id": "account-b", "label": "account-b", "auth_type": "oauth",
+             "priority": 1, "source": "manual:device_code",
+             "access_token": "account-b-access", "refresh_token": "account-b-refresh"},
+        ]},
+    })
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    for entry in pool.entries():
+        pool._sync_codex_entry_from_auth_store(entry)
+    assert pool.select().id == "account-a"
+    entries = {entry.id: entry for entry in pool.entries()}
+    assert entries["account-a"].access_token == "account-a-access"
+    assert entries["account-b"].access_token == "account-b-access"
+    assert entries["account-a"].refresh_token == "account-a-refresh"
+    assert entries["account-b"].refresh_token == "account-b-refresh"
