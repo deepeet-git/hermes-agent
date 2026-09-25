@@ -20,9 +20,13 @@ from hermes_cli.auth import AuthError, _refresh_codex_auth_tokens, resolve_codex
 STALE = {"access_token": "stale-access", "refresh_token": "stale-refresh"}
 
 
-def test_self_heals_on_stale_refresh_token(monkeypatch):
+def test_self_heals_on_stale_refresh_token(tmp_path, monkeypatch):
     """invalid_grant (relogin-required) → reimport from ~/.codex and persist it."""
     saved = {}
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({"version": 1, "providers": {
+        "openai-codex": {"tokens": dict(STALE)}
+    }}))
     fresh = {
         "access_token": "fresh-access",
         "refresh_token": "fresh-refresh",
@@ -92,3 +96,48 @@ def test_self_heals_missing_singleton_access_token_from_codex_cli(tmp_path, monk
     assert tokens["refresh_token"] == "fresh-refresh"
 
 
+def test_cli_chain_already_in_root_is_not_imported_into_profile(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (root / "auth.json").write_text(json.dumps({"version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [{"id": "root", "refresh_token": "cli-chain"}]}}))
+    monkeypatch.setattr(auth.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: {
+        "access_token": "virtual-access", "refresh_token": "cli-chain"})
+    assert auth._recover_codex_tokens_from_cli("test") is None
+    assert not (profile / "auth.json").exists()
+
+
+def test_cli_chain_is_not_imported_without_local_singleton(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (root / "auth.json").write_text(json.dumps({"version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [{"id": "root", "refresh_token": "root-chain"}]}}))
+    monkeypatch.setattr(auth.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: {
+        "access_token": "virtual-access", "refresh_token": "different-cli-chain"})
+    assert auth._recover_codex_tokens_from_cli("test") is None
+    assert not (profile / "auth.json").exists()
+
+
+def test_cli_chain_already_in_sibling_profile_is_not_imported(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "worker"
+    sibling = root / "profiles" / "sibling"
+    profile.mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    (profile / "auth.json").write_text(json.dumps({"version": 1, "providers": {
+        "openai-codex": {"tokens": {"access_token": "old", "refresh_token": "old-chain"}}}}))
+    (sibling / "auth.json").write_text(json.dumps({"version": 1, "providers": {},
+        "credential_pool": {"openai-codex": [{"id": "sibling", "refresh_token": "cli-chain"}]}}))
+    monkeypatch.setattr(auth.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setattr(auth, "_import_codex_cli_tokens", lambda: {
+        "access_token": "virtual-access", "refresh_token": "cli-chain"})
+    assert auth._recover_codex_tokens_from_cli("test") is None
+    stored = json.loads((profile / "auth.json").read_text())
+    assert stored["providers"]["openai-codex"]["tokens"]["refresh_token"] == "old-chain"

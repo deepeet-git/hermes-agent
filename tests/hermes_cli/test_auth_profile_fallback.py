@@ -179,6 +179,9 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
         }],
     }))
 
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{"id": "owned", "source": "manual", "access_token": "sk-owned"}],
+    }))
     write_credential_pool("openrouter", [{
         "id": "prof-new",
         "label": "profile-new",
@@ -186,7 +189,7 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
         "priority": 0,
         "source": "manual",
         "access_token": "sk-profile-new",
-    }])
+    }], removed_ids={"owned"})
 
     # Global auth.json unchanged.
     global_data = json.loads((profile_env["global"] / "auth.json").read_text())
@@ -198,6 +201,53 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
     # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+def test_codex_fallback_pool_writes_to_root(profile_env):
+    from hermes_cli.auth import write_credential_pool
+
+    row = {"id": "root", "source": "manual:device_code", "auth_type": "oauth",
+           "access_token": "virtual-access", "refresh_token": "virtual-refresh"}
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={"openai-codex": [row]}))
+    write_credential_pool("openai-codex", [{**row, "last_status": "exhausted"}])
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert root["credential_pool"]["openai-codex"][0]["last_status"] == "exhausted"
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_codex_fallback_singleton_refresh_writes_to_root(profile_env, monkeypatch):
+    from hermes_cli import auth
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "openai-codex": {"tokens": {"access_token": "virtual-old", "refresh_token": "virtual-chain"}}
+    }))
+    calls = []
+    def refresh(_access, chain, **_kwargs):
+        calls.append(chain)
+        return {"access_token": "virtual-new", "refresh_token": "virtual-next"}
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", refresh)
+    result = auth.resolve_codex_runtime_credentials(force_refresh=True)
+    assert result["api_key"] == "virtual-new"
+    assert calls == ["virtual-chain"]
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert root["providers"]["openai-codex"]["tokens"]["refresh_token"] == "virtual-next"
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_codex_root_singleton_seeds_only_root_pool(profile_env):
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import resolve_credential_pool_store
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "openai-codex": {"tokens": {"access_token": "virtual-access",
+                                     "refresh_token": "virtual-chain"}}
+    }))
+    assert resolve_credential_pool_store("openai-codex") == profile_env["global"] / "auth.json"
+    pool = load_pool("openai-codex")
+    assert [entry.refresh_token for entry in pool.entries()] == ["virtual-chain"]
+    root = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert [entry["refresh_token"] for entry in root["credential_pool"]["openai-codex"]] == ["virtual-chain"]
+    assert not (profile_env["profile"] / "auth.json").exists()
 
 
 
