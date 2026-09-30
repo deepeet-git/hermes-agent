@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import re
-import select
+import selectors
 import shlex
 import subprocess
 import threading
@@ -1092,10 +1092,15 @@ class BaseEnvironment(ABC):
                         pass
                 return
             idle_after_exit = 0
+            # select.select has a fixed FD_SETSIZE ceiling (1024 on macOS).
+            # Long-lived gateways can legitimately allocate pipes above it;
+            # kqueue/epoll-backed selectors preserve output at those numbers.
+            selector = selectors.DefaultSelector()
             try:
+                selector.register(fd, selectors.EVENT_READ)
                 while True:
                     try:
-                        ready, _, _ = select.select([fd], [], [], 0.1)
+                        ready = selector.select(0.1)
                     except (ValueError, OSError):
                         break  # fd already closed
                     if ready:
@@ -1115,6 +1120,7 @@ class BaseEnvironment(ABC):
                         if idle_after_exit >= 3:
                             break
             finally:
+                selector.close()
                 # Flush any bytes buffered mid-sequence.  With ``errors="replace"``
                 # this emits U+FFFD for any final incomplete sequence rather than
                 # raising.
