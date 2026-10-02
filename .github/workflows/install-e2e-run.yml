@@ -50,8 +50,9 @@ jobs:
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     steps:
-      # Full history: the sandbox fetches the starting commit and the test
-      # compares against this commit, so a shallow clone is not enough.
+      # Full history and tags: the sandbox resolves the sampled release from
+      # this checkout, avoiding repeated anonymous upstream fetches (HTTP 429).
+      # The test still installs the real release inside its isolated sandbox.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
@@ -94,6 +95,9 @@ jobs:
           # copy into a fresh fake-main commit on every invocation, moving the
           # update target mid-run.
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+          # Both the flag probe and dev-sandbox resolve the release tag here.
+          # actions/checkout fetched the same repository's full history/tags.
+          HERMES_DEV_SANDBOX_UPSTREAM: ${{ github.workspace }}
 
       # Artifact names cannot contain '/', and install-ref may be a full ref
       # like refs/heads/main. GitHub Actions expressions have no string-replace
