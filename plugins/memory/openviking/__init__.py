@@ -620,7 +620,7 @@ ADD_RESOURCE_SCHEMA = {
             },
             "wait": {
                 "type": "boolean",
-                "description": "Whether to wait for processing to complete.",
+                "description": "Observe this task until completion (default false). Deadline expiry preserves its task ID and does not cancel or resubmit indexing.",
             },
             "timeout": {
                 "type": "number",
@@ -5367,9 +5367,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return tool_error("Cannot specify both 'to' and 'parent'")
 
         payload: Dict[str, Any] = {}
-        for key in ("reason", "to", "parent", "instruction", "wait", "timeout"):
+        # Submit durably before observing: a server-side wait can outlive the
+        # HTTP deadline and lose the only task handle while indexing continues.
+        import math
+        try:
+            wait_budget = float(args.get("timeout", 30.0))
+        except (TypeError, ValueError):
+            return tool_error("timeout must be a finite non-negative number")
+        if not math.isfinite(wait_budget) or wait_budget < 0:
+            return tool_error("timeout must be a finite non-negative number")
+        for key in ("reason", "to", "parent", "instruction"):
             if key in args and args[key] not in {None, ""}:
                 payload[key] = args[key]
+        payload["wait"] = False
 
         parsed_url = urlparse(url)
         if _is_remote_resource_source(url):
@@ -5414,11 +5424,69 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if cleanup_path:
                 cleanup_path.unlink(missing_ok=True)
 
-        return json.dumps({
-            "status": "added",
+        task_id = result.get("task_id", "")
+        output = {
+            "status": result.get("status") or ("queued" if task_id else "unknown"),
             "root_uri": result.get("root_uri", ""),
-            "message": "Resource queued for processing. Use viking_search after a moment to find it.",
-        }, ensure_ascii=False)
+            "task_id": task_id,
+        }
+        if not task_id:
+            output["message"] = "Submission returned no task handle; completion is unknown. Do not resubmit automatically."
+            return json.dumps(output, ensure_ascii=False)
+        output["status_endpoint"] = f"/api/v1/tasks/{task_id}"
+        output["message"] = "Resource accepted for background processing; indexing is not yet verified. Do not resubmit this task."
+        if args.get("wait", False):
+            self._observe_resource_task(output, wait_budget)
+        return json.dumps(output, ensure_ascii=False)
+
+    def _observe_resource_task(self, output: dict, budget: float) -> None:
+        """Bound observation independently of the durable server task."""
+        import httpx
+
+        client = self._client
+        if client is None:
+            output["observation_status"] = "unavailable"
+            return
+        deadline = time.monotonic() + budget
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                output["observation_status"] = "deadline_reached"
+                return
+            try:
+                response = client.get(
+                    output["status_endpoint"], timeout=min(_TIMEOUT, remaining),
+                )
+            except (TimeoutError, httpx.TimeoutException):
+                output["observation_status"] = "timeout"
+                return
+            except Exception:
+                # The accepted task remains valid even if the observer fails.
+                output["observation_status"] = "unavailable"
+                return
+            task = self._unwrap_result(response)
+            if not isinstance(task, dict) or not isinstance(task.get("status"), str):
+                output["observation_status"] = "invalid_response"
+                return
+            output["status"] = task["status"]
+            task_result = task.get("result") or {}
+            if isinstance(task_result, dict):
+                output["root_uri"] = task_result.get("root_uri") or output["root_uri"]
+            if task["status"] in {"completed", "failed", "cancelled"}:
+                output["observation_status"] = "terminal"
+                output["message"] = (
+                    "Resource processing completed."
+                    if task["status"] == "completed"
+                    else "Resource processing did not complete successfully; inspect the task before retrying."
+                )
+                if task["status"] == "completed" and isinstance(task_result, dict):
+                    for key in ("queue_status", "warnings"):
+                        if key in task_result:
+                            output[key] = task_result[key]
+                return
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.5, remaining))
 
 
 # ---------------------------------------------------------------------------
