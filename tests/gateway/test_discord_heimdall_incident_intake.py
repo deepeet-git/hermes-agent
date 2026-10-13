@@ -721,6 +721,10 @@ _SCOPE = {
 }
 
 
+_PARENT_ID = 100000000000000002
+_FP = DiscordAdapter._heimdall_incident_fingerprint_for_embeds(_alert().embeds)
+
+
 def _thread(thread_id, **overrides):
     thread = SimpleNamespace(
         id=thread_id,
@@ -755,12 +759,20 @@ def _unknown_channel():
 
 
 class _FakeClient:
-    """Discord stand-in: ``threads`` maps id -> thread, ``errors`` id -> exception."""
+    """Discord stand-in: ``threads`` maps id -> thread, ``errors`` id -> exception.
+
+    ``messages`` holds alerts still readable in the configured parent channel;
+    ``message_errors`` makes reading one of them fail.
+    """
 
     def __init__(self, threads=None, errors=None):
         self.threads = dict(threads or {})
         self.errors = dict(errors or {})
+        self.messages = {}
+        self.message_errors = {}
         self.fetches = []
+        self.message_fetches = []
+        self.parent = SimpleNamespace(id=_PARENT_ID, fetch_message=self._fetch_message)
 
     async def fetch_channel(self, thread_id):
         self.fetches.append(thread_id)
@@ -768,7 +780,17 @@ class _FakeClient:
             raise self.errors[thread_id]
         if thread_id in self.threads:
             return self.threads[thread_id]
+        if thread_id == _PARENT_ID:
+            return self.parent
         raise _unknown_channel()
+
+    async def _fetch_message(self, message_id):
+        self.message_fetches.append(message_id)
+        if message_id in self.message_errors:
+            raise self.message_errors[message_id]
+        if message_id in self.messages:
+            return self.messages[message_id]
+        raise _http_error(404, 10008)
 
 
 def _starter(message_id, client, *, error=None):
@@ -789,9 +811,9 @@ def _starter(message_id, client, *, error=None):
     return message
 
 
-def _intake(adapter, message):
+def _intake(adapter, message, fingerprint="fingerprint"):
     return adapter._get_or_create_heimdall_incident_thread(
-        "fingerprint",
+        fingerprint,
         message,
         lambda: adapter._create_heimdall_incident_thread(message, name_source="Database alert"),
     )
@@ -897,14 +919,14 @@ def test_store_io_error_is_not_an_empty_ledger(tmp_path: Path, monkeypatch):
     store = HeimdallIncidentThreadStore(state_path)
     assert store.remember("fingerprint", _SCOPE, "505")
     original = state_path.read_text(encoding="utf-8")
-    real_read_text = Path.read_text
+    real_read_bytes = Path.read_bytes
 
-    def failing_read_text(self, *args, **kwargs):
+    def failing_read_bytes(self, *args, **kwargs):
         if self == state_path:
             raise OSError("disk unavailable")
-        return real_read_text(self, *args, **kwargs)
+        return real_read_bytes(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", failing_read_text)
+    monkeypatch.setattr(Path, "read_bytes", failing_read_bytes)
     adapter = _adapter(_config())
     adapter._heimdall_incident_store = store
     adapter._client = _FakeClient()
@@ -916,7 +938,7 @@ def test_store_io_error_is_not_an_empty_ledger(tmp_path: Path, monkeypatch):
     )) == (None, False)
     create.assert_not_awaited()
 
-    monkeypatch.setattr(Path, "read_text", real_read_text)
+    monkeypatch.setattr(Path, "read_bytes", real_read_bytes)
     assert state_path.read_text(encoding="utf-8") == original
     assert store.is_healthy
     assert store.remember("other", _SCOPE, "506")
@@ -1069,30 +1091,58 @@ def test_unknown_pending_receipt_is_never_superseded_by_unknown_channel(tmp_path
     assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)["pending"] is True
 
 
-def test_definitive_create_rejection_cleans_up_or_restores_previous_record(tmp_path: Path):
+@pytest.mark.parametrize(
+    "error",
+    [_http_error(403, 50013), _http_error(404, 10008), _http_error(400, 50035)],
+    ids=["403", "404", "400"],
+)
+def test_final_4xx_is_not_proof_and_keeps_pending_receipt(tmp_path: Path, error):
+    """discord.py may have retried a 5xx that already created the thread."""
     state_path = tmp_path / "discord_heimdall_incidents.json"
     client = _FakeClient()
-    rejected = _http_error(403, 50013)
 
-    # MISSING: the pending receipt is removed again.
-    message = _starter(100000000000000020, client, error=rejected)
+    # MISSING: the pending receipt stays and the original id is checked.
+    message = _starter(100000000000000020, client, error=error)
     assert asyncio.run(_intake(_adapter_with_store(state_path, client), message)) == (None, False)
-    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE) is None
-    assert client.fetches == []
+    incident = HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+    assert incident["thread_id"] == str(message.id) and incident["pending"] is True
+    assert client.fetches == [message.id]
 
-    # GONE: the confirmed record and its lineage are restored exactly.
+    # GONE: the superseded lineage is kept with the pending receipt.
+    other = tmp_path / "other.json"
+    HeimdallIncidentThreadStore(other).remember("fingerprint", _SCOPE, "505")
+    message = _starter(100000000000000021, client, error=error)
+    assert asyncio.run(_intake(_adapter_with_store(other, client), message)) == (None, False)
+    incident = HeimdallIncidentThreadStore(other).get("fingerprint", _SCOPE)
+    assert incident["pending"] is True and incident["superseded_thread_ids"] == ["505"]
+
+
+def test_final_4xx_after_landed_create_recovers_the_same_thread(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    message = _starter(100000000000000020, client, error=_http_error(403, 50013))
+    client.threads[message.id] = _thread(message.id)  # an earlier internal attempt landed
+
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), message))
+
+    assert thread.id == message.id and reused is False
+    assert "pending" not in HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+
+
+def test_local_refusal_restores_previous_record_and_failed_restore_is_not_success(
+    tmp_path: Path, monkeypatch,
+):
+    """Only a refusal that sends no request may drop the pending receipt."""
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
     HeimdallIncidentThreadStore(state_path).remember("fingerprint", _SCOPE, "505")
     before = HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
-    message = _starter(100000000000000021, client, error=rejected)
+    message = _alert(id=100000000000000020, create_thread=None)
     assert asyncio.run(_intake(_adapter_with_store(state_path, client), message)) == (None, False)
     assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE) == before
 
-
-def test_failed_restore_after_rejection_is_not_success(tmp_path: Path, monkeypatch):
-    state_path = tmp_path / "discord_heimdall_incidents.json"
-    client = _FakeClient()
-    adapter = _adapter_with_store(state_path, client)
-    store = adapter._heimdall_incident_store
+    fresh = tmp_path / "fresh.json"
+    adapter = _adapter_with_store(fresh, client)
     real_replace = HeimdallIncidentThreadStore.replace
     calls = []
 
@@ -1101,14 +1151,9 @@ def test_failed_restore_after_rejection_is_not_success(tmp_path: Path, monkeypat
         return real_replace(self, *args) if len(calls) == 1 else False
 
     monkeypatch.setattr(HeimdallIncidentThreadStore, "replace", replace)
-    message = _starter(
-        100000000000000020, client,
-        error=_http_error(403, 50013),
-    )
-
     assert asyncio.run(_intake(adapter, message)) == (None, False)
     assert len(calls) == 2
-    assert store.get("fingerprint", _SCOPE)["pending"] is True
+    assert adapter._heimdall_incident_store.get("fingerprint", _SCOPE)["pending"] is True
 
 
 def test_create_success_then_confirm_failure_recovers_same_thread_after_restart(
@@ -1178,3 +1223,297 @@ def test_burst_of_35_distinct_incidents_across_two_adapters_all_survive_restart(
     for index, message in enumerate(messages):
         incident = restarted.get(f"fingerprint-{index}", _SCOPE)
         assert incident["thread_id"] == str(message.id) and "pending" not in incident
+
+
+# ── Pending receipt liveness: retry only the original starter, never another ──
+
+
+def _pending_ledger(state_path, starter_id=100000000000000020, superseded=()):
+    store = HeimdallIncidentThreadStore(state_path)
+    pending = store._record(_FP, _SCOPE, str(starter_id), pending=True, superseded=list(superseded))
+    assert store.replace(_FP, _SCOPE, None, pending)
+    return pending
+
+
+def test_cancel_before_create_recovers_on_original_starter_after_restart(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    first = _starter(100000000000000020, client)
+    adapter = _adapter_with_store(state_path, client)
+
+    async def cancelled_before_request():
+        raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter._get_or_create_heimdall_incident_thread(_FP, first, cancelled_before_request))
+    assert HeimdallIncidentThreadStore(state_path).get(_FP, _SCOPE)["pending"] is True
+    client.messages[first.id] = first
+
+    second = _starter(100000000000000021, client)
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), second, _FP))
+
+    assert thread.id == first.id and reused is True
+    assert second.create_calls == [] and len(first.create_calls) == 1
+    assert set(client.threads) == {first.id}
+    incident = HeimdallIncidentThreadStore(state_path).get(_FP, _SCOPE)
+    assert incident["thread_id"] == str(first.id) and "pending" not in incident
+
+    third = _starter(100000000000000022, client)
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), third, _FP))
+    assert thread.id == first.id and reused is True
+    assert len(first.create_calls) == 1 and third.create_calls == []
+
+
+def test_pending_retry_is_bounded_and_keeps_receipt_until_permissions_return(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    _pending_ledger(state_path, superseded=["505"])
+    first = _starter(100000000000000020, client, error=_http_error(403, 50013))
+    client.messages[first.id] = first
+
+    for index in range(2):
+        later = _starter(100000000000000021 + index, client)
+        assert asyncio.run(_intake(_adapter_with_store(state_path, client), later, _FP)) == (None, False)
+        assert later.create_calls == []
+        assert len(first.create_calls) == index + 1  # one retry per alert
+    assert HeimdallIncidentThreadStore(state_path).get(_FP, _SCOPE)["pending"] is True
+
+    # Permissions restored: the same original message gets its thread.
+    restored = _starter(100000000000000020, client)
+    client.messages[first.id] = restored
+    later = _starter(100000000000000023, client)
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), later, _FP))
+    assert thread.id == first.id and reused is True and later.create_calls == []
+    incident = HeimdallIncidentThreadStore(state_path).get(_FP, _SCOPE)
+    assert "pending" not in incident and incident["superseded_thread_ids"] == ["505"]
+
+
+def test_pending_retry_after_late_first_completion_recovers_receipt(tmp_path: Path):
+    """The first request lands after the lookup: Discord answers 160004."""
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    _pending_ledger(state_path)
+    first = _starter(100000000000000020, client, error=_http_error(400, 160004))
+    client.messages[first.id] = first
+    real_fetch = client.fetch_channel
+    lookups = []
+
+    async def fetch_channel(channel_id):
+        if channel_id == first.id:
+            lookups.append(channel_id)
+            if len(lookups) == 2:  # the late first request has landed by now
+                client.threads[first.id] = _thread(first.id)
+        return await real_fetch(channel_id)
+
+    client.fetch_channel = fetch_channel
+    later = _starter(100000000000000021, client)
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), later, _FP))
+    assert thread.id == first.id and reused is True
+    assert set(client.threads) == {first.id} and later.create_calls == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["deleted", "forbidden", "timeout", "other-incident", "wrong-guild", "wrong-parent",
+     "wrong-webhook", "wrong-id", "no-client"],
+)
+def test_pending_retry_defers_unless_original_starter_is_this_exact_alert(tmp_path: Path, case):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    pending = _pending_ledger(state_path)
+    client = _FakeClient()
+    first = _starter(100000000000000020, client)
+    client.messages[first.id] = first
+    if case == "deleted":
+        client.message_errors[first.id] = _http_error(404, 10008)
+    elif case == "forbidden":
+        client.message_errors[first.id] = _http_error(403, 50001)
+    elif case == "timeout":
+        client.message_errors[first.id] = asyncio.TimeoutError()
+    elif case == "other-incident":
+        first.embeds = [SimpleNamespace(title="Other", description="disk unhealthy", fields=[])]
+    elif case == "wrong-guild":
+        first.guild = SimpleNamespace(id=999)
+    elif case == "wrong-parent":
+        first.channel = SimpleNamespace(id=999)
+    elif case == "wrong-webhook":
+        first.webhook_id = 999
+    elif case == "wrong-id":
+        client.messages[first.id] = _starter(100000000000000029, client)
+    later = _starter(100000000000000021, client)
+    adapter = _adapter_with_store(state_path, None if case == "no-client" else client)
+
+    assert asyncio.run(_intake(adapter, later, _FP)) == (None, False)
+    assert first.create_calls == [] and later.create_calls == []
+    assert not client.threads
+    assert HeimdallIncidentThreadStore(state_path).get(_FP, _SCOPE) == pending
+
+
+def test_non_utf8_state_is_quarantined_without_breaking_adapter(tmp_path: Path, monkeypatch):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    state_path.write_bytes(b"\xff\xfe")
+    store = HeimdallIncidentThreadStore(state_path)
+    assert store.is_healthy is False
+    assert store.remember("fingerprint", _SCOPE, "505") is False
+
+    monkeypatch.setattr(
+        HeimdallIncidentThreadStore, "default", classmethod(lambda cls: cls(state_path)),
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test"))
+    assert adapter._heimdall_incident_store.is_healthy is False
+    adapter.config.extra = {"heimdall_incident_intake": _config()}
+    assert adapter._heimdall_incident_admission(_alert()) == (False, "", "")
+    assert state_path.read_bytes() == b"\xff\xfe"
+
+
+_TRANSPORT_SCRIPT = r'''
+import asyncio, json, sys
+from pathlib import Path
+from types import SimpleNamespace
+import discord  # the real discord.py, before any adapter import
+from discord.http import HTTPClient, Route
+from gateway.config import PlatformConfig
+from plugins.platforms.discord.adapter import DiscordAdapter, HeimdallIncidentThreadStore
+
+state_path, mode = Path(sys.argv[1]), sys.argv[2]
+GUILD, PARENT, WEBHOOK, AUTHOR = 100000000000000001, 100000000000000002, 100000000000000004, 100000000000000003
+CONFIG = {"guild_id": str(GUILD), "channel_id": str(PARENT), "webhook_id": str(WEBHOOK),
+          "author_id": str(AUTHOR), "toolsets": ["safe"]}
+SCOPE = {"guild_id": str(GUILD), "channel_id": str(PARENT), "webhook_id": str(WEBHOOK)}
+
+
+class Response:
+    reason = "synthetic"
+
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+        self.headers = {"content-type": "application/json"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def text(self, **kwargs):
+        return json.dumps(self.body)
+
+
+class Discord:
+    """Server stand-in: one thread per message, id == message id."""
+
+    def __init__(self, script):
+        self.script, self.threads, self.posts = list(script), {}, []
+
+    def request(self, method, url, **kwargs):
+        message_id = int(url.rstrip("/").split("/")[-2])
+        self.posts.append(message_id)
+        step = self.script.pop(0) if self.script else "ok"
+        if step == "deny":
+            return Response(403, {"code": 50013, "message": "Missing Permissions"})
+        if message_id in self.threads:
+            return Response(400, {"code": 160004, "message": "already created"})
+        if step == "deny-after-nothing":
+            return Response(403, {"code": 50013, "message": "Missing Permissions"})
+        self.threads[message_id] = SimpleNamespace(
+            id=message_id, parent_id=PARENT, guild=SimpleNamespace(id=GUILD),
+        )
+        if step == "commit-502":
+            return Response(502, {"code": 0, "message": "Bad Gateway"})
+        return Response(200, {"id": str(message_id)})
+
+    async def fetch_channel(self, channel_id):
+        if channel_id == PARENT:
+            return SimpleNamespace(id=PARENT, fetch_message=self.fetch_message)
+        if channel_id in self.threads:
+            return self.threads[channel_id]
+        raise discord.NotFound(Response(404, {}), {"code": 10003, "message": "Unknown Channel"})
+
+    async def fetch_message(self, message_id):
+        return self.messages[message_id]
+
+
+def adapter_for(server):
+    adapter = object.__new__(DiscordAdapter)
+    adapter.config = PlatformConfig(enabled=True, token="test")
+    adapter.config.extra = {"heimdall_incident_intake": CONFIG}
+    adapter._threads = SimpleNamespace(mark=lambda _id: None)
+    adapter._dedup = SimpleNamespace(is_duplicate=lambda _id: False)
+    adapter._heimdall_incident_store = HeimdallIncidentThreadStore(state_path)
+    adapter._client = server
+    return adapter
+
+
+def alert(message_id, http):
+    message = SimpleNamespace(
+        id=message_id, guild=SimpleNamespace(id=GUILD), channel=SimpleNamespace(id=PARENT),
+        author=SimpleNamespace(id=AUTHOR, bot=True), webhook_id=WEBHOOK, content="", attachments=[],
+        embeds=[SimpleNamespace(title="Alert", description="database unhealthy", fields=[])],
+    )
+
+    async def create_thread(**kwargs):
+        route = Route("POST", "/channels/{channel_id}/messages/{message_id}/threads",
+                      channel_id=PARENT, message_id=message_id)
+        await http.request(route, json={"name": kwargs["name"]})
+        return server.threads[message_id]
+
+    message.create_thread = create_thread
+    return message
+
+
+async def intake(adapter, message):
+    admitted, text, fingerprint = adapter._heimdall_incident_admission(message)
+    assert admitted
+    return await adapter._get_or_create_heimdall_incident_thread(
+        fingerprint, message,
+        lambda: adapter._create_heimdall_incident_thread(message, name_source=text),
+    )
+
+
+async def main():
+    global server
+    first_steps = {"commit": ["commit-502", "deny"], "nothing": ["deny-after-nothing"]}[mode]
+    server = Discord(first_steps)
+    http = HTTPClient(asyncio.get_running_loop())
+    http._global_over = asyncio.Event()
+    http._global_over.set()
+    http._HTTPClient__session = server
+    first = alert(100000000000000020, http)
+    server.messages = {first.id: first}
+    result = await intake(adapter_for(server), first)
+    outcome = {"first": None if result[0] is None else result[0].id, "first_posts": len(server.posts)}
+    second = alert(100000000000000021, http)
+    thread, reused = await intake(adapter_for(server), second)
+    outcome.update(second=thread.id, reused=reused, threads=sorted(server.threads), posts=server.posts)
+    outcome["pending"] = HeimdallIncidentThreadStore(state_path).get(
+        DiscordAdapter._heimdall_incident_fingerprint_for_embeds(first.embeds), SCOPE,
+    ).get("pending", False)
+    print(json.dumps(outcome))
+
+
+asyncio.run(main())
+'''
+
+
+@pytest.mark.parametrize("mode", ["commit", "nothing"])
+def test_real_discord_py_retry_then_403_never_creates_a_second_thread(tmp_path: Path, mode):
+    """Real discord.py HTTPClient: a 502 retried into 403 hides the first outcome."""
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ, PYTHONPATH=str(repo_root))
+    run = subprocess.run(
+        [sys.executable, "-c", _TRANSPORT_SCRIPT, str(tmp_path / "state.json"), mode],
+        cwd=repo_root, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert run.returncode == 0, run.stderr
+    outcome = json.loads(run.stdout.strip().splitlines()[-1])
+    first, second = 100000000000000020, 100000000000000021
+    if mode == "commit":
+        # 502 (thread created) -> internal retry -> 403: the receipt is recovered.
+        assert outcome["first"] == first and outcome["first_posts"] == 2
+        assert outcome["posts"] == [first, first]
+    else:
+        # 403 with nothing created: pending kept, then the same starter is retried.
+        assert outcome["first"] is None and outcome["first_posts"] == 1
+        assert outcome["posts"] == [first, first]
+    assert outcome["second"] == first and outcome["reused"] is True
+    assert outcome["threads"] == [first]
+    assert second not in outcome["posts"] and outcome["pending"] is False

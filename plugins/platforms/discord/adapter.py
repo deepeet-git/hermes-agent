@@ -172,6 +172,7 @@ _HEIMDALL_LOOKUP_MISSING = "missing"
 _HEIMDALL_LOOKUP_FOUND = "found"
 _HEIMDALL_LOOKUP_DEFER = "defer"
 _HEIMDALL_LOOKUP_GONE = "gone"
+_HEIMDALL_LOOKUP_PENDING_MISSING = "pending_missing"
 _HEIMDALL_CREATE_CREATED = "created"
 _HEIMDALL_CREATE_ABSENT = "absent"
 _HEIMDALL_CREATE_DEFER = "defer"
@@ -257,17 +258,18 @@ class HeimdallIncidentThreadStore:
 
         A missing file is the only empty state. ``OSError`` raises
         ``HeimdallIncidentStoreUnavailable`` for this attempt only; invalid
-        content marks the store corrupt until an operator repairs it.
+        content, including bytes that are not UTF-8, marks the store corrupt
+        until an operator repairs it. The file itself is never rewritten here.
         """
         try:
-            raw = self._path.read_text(encoding="utf-8")
+            raw = self._path.read_bytes()
         except FileNotFoundError:
             return []
         except OSError as exc:
             logger.warning("Could not read Heimdall incident state %s: %s", self._path, exc)
             raise HeimdallIncidentStoreUnavailable(str(exc)) from exc
         try:
-            data = json.loads(raw)
+            data = json.loads(raw.decode("utf-8"))
             incidents = data.get("incidents") if isinstance(data, dict) else None
             if (
                 data.get("version") != self._VERSION
@@ -2099,8 +2101,10 @@ class DiscordAdapter(BasePlatformAdapter):
         """Classify the persisted incident thread without changing the mapping.
 
         Only Discord's definitive Unknown Channel for a confirmed thread is
-        ``GONE``. Timeouts, DNS, 429, 5xx, 403, unknown errors, a wrong parent
-        or guild, and any 404 for an unconfirmed (pending) starter are
+        ``GONE``. The same answer for an unconfirmed (pending) starter is
+        ``PENDING_MISSING``: it is not proof that nothing was created, so the
+        mapping is kept and only that same starter may be retried. Timeouts,
+        DNS, 429, 5xx, 403, unknown errors, and a wrong parent or guild are
         ``DEFER``: the mapping is kept and no new thread may be created.
         """
         scope = self._heimdall_incident_scope()
@@ -2124,6 +2128,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if status == 404 and code == 10003 and not incident.get("pending"):
                 logger.warning("Heimdall incident thread %s was deleted on Discord", thread_id)
                 return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_GONE, None, incident)
+            if status == 404 and code == 10003:
+                logger.warning("Heimdall incident starter %s has no thread yet", thread_id)
+                return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_PENDING_MISSING, None, incident)
             logger.warning("Deferring Heimdall incident thread %s lookup: %s", thread_id, exc)
             return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_DEFER, None, incident)
         if not self._heimdall_thread_in_scope(thread, scope):
@@ -2146,23 +2153,22 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> _HeimdallCreateResult:
         """Start the incident thread on the alert itself, exactly once.
 
-        Unlike ``_auto_create_thread`` there is no seed-message fallback and no
-        retry: a thread started from a message has that message's id, so the
-        alert id is the creation receipt. An unclear failure (timeout, 429,
-        5xx, network, or 160004 "thread already created") is recovered by
-        fetching that id; only a definitive 4xx proves nothing was created.
+        Unlike ``_auto_create_thread`` there is no seed-message fallback: a
+        thread started from a message has that message's id, so the alert id
+        is the creation receipt. Every failure is recovered by fetching that
+        id. A final 4xx is not proof either: discord.py retries 5xx/resets
+        inside one call, so an earlier attempt may already have created the
+        thread before the error that is surfaced here. Only a local refusal
+        that sends no request is ``ABSENT``.
         """
         thread_name = self._derive_auto_thread_name(name_source)
+        start_thread = getattr(message, "create_thread", None)
+        if not callable(start_thread):
+            logger.warning("Refusing Heimdall incident thread: starter cannot start a thread")
+            return _HeimdallCreateResult(_HEIMDALL_CREATE_ABSENT, None)
         try:
-            thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+            thread = await start_thread(name=thread_name, auto_archive_duration=1440)
         except Exception as exc:
-            status, code = self._heimdall_http_error(exc)
-            if (
-                status is not None and 400 <= status < 500
-                and status != 429 and code != 160004
-            ):
-                logger.warning("Discord rejected Heimdall incident thread creation: %s", exc)
-                return _HeimdallCreateResult(_HEIMDALL_CREATE_ABSENT, None)
             logger.warning("Heimdall incident thread creation outcome unknown: %s", exc)
             scope = self._heimdall_incident_scope()
             try:
@@ -2177,11 +2183,56 @@ class DiscordAdapter(BasePlatformAdapter):
             if not self._heimdall_thread_in_scope(thread, scope):
                 logger.error("Heimdall incident thread receipt is outside its parent")
                 return _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
+            if str(getattr(thread, "id", "")) != str(message.id):
+                logger.error("Heimdall incident thread receipt does not match its starter")
+                return _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
         try:
             setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
         except Exception:
             pass
         return _HeimdallCreateResult(_HEIMDALL_CREATE_CREATED, thread)
+
+    async def _retry_pending_heimdall_starter(
+        self, fingerprint: str, scope: dict[str, str], incident: dict[str, Any], message: Any,
+    ) -> _HeimdallCreateResult:
+        """Retry thread creation once on the pending receipt's own starter.
+
+        Discord allows one thread per message and gives it the message's id,
+        so starting it again on the same message cannot make a second thread:
+        a late first request then fails with 160004 and the retry recovers the
+        receipt, or the retry fails the same way. The original message is
+        fetched from the configured parent and must still be the exact trusted
+        alert for this incident. Any doubt defers; no other starter is used.
+        """
+        starter_id = str(incident["thread_id"])
+        try:
+            if str(getattr(message, "id", "")) == starter_id:
+                starter = message
+            else:
+                if self._client is None:
+                    raise RuntimeError("Discord client unavailable")
+                parent_id = int(scope["channel_id"])
+                get_channel = getattr(self._client, "get_channel", None)
+                parent = get_channel(parent_id) if callable(get_channel) else None
+                if parent is None:
+                    parent = await self._client.fetch_channel(parent_id)
+                starter = await parent.fetch_message(int(starter_id))
+        except Exception as exc:
+            logger.warning("Deferring Heimdall incident: starter %s unavailable: %s", starter_id, exc)
+            return _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
+        admitted, starter_text, starter_fingerprint = self._heimdall_incident_admission(starter)
+        if (
+            not admitted
+            or str(getattr(starter, "id", "")) != starter_id
+            or starter_fingerprint != fingerprint
+        ):
+            logger.error("Deferring Heimdall incident: starter %s is not this incident's alert", starter_id)
+            return _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
+        result = await self._create_heimdall_incident_thread(starter, name_source=starter_text)
+        if result.kind != _HEIMDALL_CREATE_CREATED or str(getattr(result.thread, "id", "")) != starter_id:
+            # Never clean up here: the earlier request may still land.
+            return _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
+        return result
 
     async def _get_or_create_heimdall_incident_thread(
         self,
@@ -2221,6 +2272,24 @@ class DiscordAdapter(BasePlatformAdapter):
                             logger.warning("Could not confirm recovered Heimdall incident thread")
                     self._threads.mark(str(lookup.thread.id))
                     return lookup.thread, True
+                if lookup.kind == _HEIMDALL_LOOKUP_PENDING_MISSING and lookup.incident:
+                    result = await self._retry_pending_heimdall_starter(
+                        fingerprint, scope, lookup.incident, message,
+                    )
+                    if result.kind != _HEIMDALL_CREATE_CREATED or result.thread is None:
+                        return None, False
+                    thread = result.thread
+                    confirmed = dict(lookup.incident)
+                    confirmed.pop("pending", None)
+                    confirmed["updated_at"] = store._now()
+                    if not await asyncio.to_thread(
+                        store.replace, fingerprint, scope, lookup.incident, confirmed,
+                    ):
+                        # The pending receipt already names this thread.
+                        logger.warning("Could not confirm Heimdall incident thread; receipt kept")
+                    self._threads.mark(str(thread.id))
+                    self._dedup.is_duplicate(str(thread.id))
+                    return thread, str(thread.id) != str(getattr(message, "id", ""))
                 if lookup.kind not in {_HEIMDALL_LOOKUP_MISSING, _HEIMDALL_LOOKUP_GONE}:
                     return None, False
                 starter_id = str(getattr(message, "id", "") or "")
@@ -2248,8 +2317,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         result,
                     )
                 if result.kind == _HEIMDALL_CREATE_ABSENT:
-                    # Discord proved nothing was created: put back exactly what
-                    # was there. A failed restore is still a failure; the pending
+                    # No request was sent, so nothing was created: put back
+                    # exactly what was there. A failed restore is still a failure; the pending
                     # receipt stays and later alerts defer on it.
                     if not await asyncio.to_thread(store.replace, fingerprint, scope, pending, previous):
                         logger.error("Could not restore Heimdall incident state after rejection")
