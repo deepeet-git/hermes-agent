@@ -1,11 +1,18 @@
 """Regression tests for the opt-in, fail-closed Heimdall Discord intake."""
 
 import asyncio
+import concurrent.futures
+import json
+import os
+import subprocess
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 
 from gateway.config import PlatformConfig
@@ -28,6 +35,7 @@ def _adapter(config):
 
 def _alert(**overrides):
     message = SimpleNamespace(
+        id=100000000000000010,
         guild=SimpleNamespace(id=100000000000000001),
         channel=SimpleNamespace(id=100000000000000002),
         author=SimpleNamespace(id=100000000000000003, bot=True),
@@ -120,7 +128,7 @@ async def test_heimdall_embed_only_alert_reaches_handler_through_required_mentio
     adapter._client = Client()
     adapter._ready_event.set()
     adapter._text_batch_delay_seconds = 0
-    adapter._auto_create_thread = AsyncMock(return_value=created_thread)
+    adapter._create_heimdall_incident_thread = AsyncMock(return_value=created_thread)
     adapter.handle_message = AsyncMock()
 
     def event(message_id, *, webhook_id=100000000000000004, author=None, embeds=None):
@@ -155,8 +163,8 @@ async def test_heimdall_embed_only_alert_reaches_handler_through_required_mentio
     assert adapter._discord_message_admission(first, claim=False)[0] is True
     assert await adapter._dispatch_discord_message(first) is True
     assert await adapter._dispatch_discord_message(repeated) is True
-    assert adapter._auto_create_thread.await_count == 1
-    assert adapter._auto_create_thread.await_args.kwargs["name_source"] == (
+    assert adapter._create_heimdall_incident_thread.await_count == 1
+    assert adapter._create_heimdall_incident_thread.await_args.kwargs["name_source"] == (
         "Database alert\ndatabase unhealthy\nIncident ID\ndatabase-primary"
     )
     created_thread.send.assert_awaited_once()
@@ -231,7 +239,7 @@ async def test_heimdall_intake_does_not_mutate_slots_based_discord_message(
     )
     adapter._ready_event.set()
     adapter._text_batch_delay_seconds = 0
-    adapter._auto_create_thread = AsyncMock(return_value=IncidentThread())
+    adapter._create_heimdall_incident_thread = AsyncMock(return_value=IncidentThread())
     adapter.handle_message = AsyncMock()
 
     message = SlotsMessage()
@@ -665,8 +673,8 @@ def test_reused_heimdall_alert_uses_webhook_delete_without_manage_messages(monke
     [None, SimpleNamespace(id=505, parent_id=999, guild=SimpleNamespace(id=101))],
     ids=["missing", "wrong-parent"],
 )
-def test_heimdall_stale_or_wrong_parent_mapping_is_removed_fail_closed(tmp_path: Path, thread):
-    """A stale mapping cannot route a trusted alert to a different thread."""
+def test_heimdall_missing_or_wrong_parent_mapping_defers_and_is_kept(tmp_path: Path, thread):
+    """A wrong-parent/missing result neither routes, forgets, nor creates."""
     state_path = tmp_path / "discord_heimdall_incidents.json"
     scope = {"guild_id": "100000000000000001", "channel_id": "100000000000000002", "webhook_id": "100000000000000004"}
     HeimdallIncidentThreadStore(state_path, now=lambda: 100.0).remember("fingerprint", scope, "505")
@@ -683,7 +691,13 @@ def test_heimdall_stale_or_wrong_parent_mapping_is_removed_fail_closed(tmp_path:
     adapter._client = Client()
 
     assert asyncio.run(adapter._resolve_heimdall_incident_thread("fingerprint", _alert())) is None
-    assert adapter._heimdall_incident_store.get("fingerprint", scope) is None
+    assert adapter._heimdall_incident_store.get("fingerprint", scope)["thread_id"] == "505"
+    create = AsyncMock()
+    assert asyncio.run(adapter._get_or_create_heimdall_incident_thread(
+        "fingerprint", _alert(), create,
+    )) == (None, False)
+    create.assert_not_awaited()
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", scope)["thread_id"] == "505"
 
 
 def test_heimdall_corrupt_mapping_fails_closed_and_is_not_overwritten(tmp_path: Path):
@@ -696,3 +710,471 @@ def test_heimdall_corrupt_mapping_fails_closed_and_is_not_overwritten(tmp_path: 
     assert store.get("fingerprint", scope) is None
     assert store.remember("fingerprint", scope, "505") is False
     assert state_path.read_text(encoding="utf-8") == "not-json"
+
+
+# ── Durable correlation: no eviction, no lost updates, no duplicate threads ──
+
+_SCOPE = {
+    "guild_id": "100000000000000001",
+    "channel_id": "100000000000000002",
+    "webhook_id": "100000000000000004",
+}
+
+
+def _thread(thread_id, **overrides):
+    thread = SimpleNamespace(
+        id=thread_id,
+        parent_id=100000000000000002,
+        guild=SimpleNamespace(id=100000000000000001),
+    )
+    for key, value in overrides.items():
+        setattr(thread, key, value)
+    return thread
+
+
+class _FakeHTTPException(Exception):
+    """Mirrors discord.HTTPException's ``status``/``code`` (gateway tests mock discord)."""
+
+    def __init__(self, status, code=0):
+        super().__init__(f"{status} (error code: {code})")
+        self.status = status
+        self.code = code
+
+
+@pytest.fixture(autouse=True)
+def _discord_http_exception(monkeypatch):
+    monkeypatch.setattr(discord_platform.discord, "HTTPException", _FakeHTTPException, raising=False)
+
+
+def _http_error(status, code=0):
+    return _FakeHTTPException(status, code)
+
+
+def _unknown_channel():
+    return _http_error(404, 10003)
+
+
+class _FakeClient:
+    """Discord stand-in: ``threads`` maps id -> thread, ``errors`` id -> exception."""
+
+    def __init__(self, threads=None, errors=None):
+        self.threads = dict(threads or {})
+        self.errors = dict(errors or {})
+        self.fetches = []
+
+    async def fetch_channel(self, thread_id):
+        self.fetches.append(thread_id)
+        if thread_id in self.errors:
+            raise self.errors[thread_id]
+        if thread_id in self.threads:
+            return self.threads[thread_id]
+        raise _unknown_channel()
+
+
+def _starter(message_id, client, *, error=None):
+    """An alert message whose ``create_thread`` behaves like discord.py."""
+    calls = []
+
+    async def create_thread(**kwargs):
+        calls.append(kwargs)
+        if error is not None:
+            raise error
+        thread = _thread(message_id)
+        client.threads[message_id] = thread
+        return thread
+
+    message = _alert(id=message_id, create_thread=create_thread)
+    message.channel = SimpleNamespace(id=100000000000000002, send=AsyncMock())
+    message.create_calls = calls
+    return message
+
+
+def _intake(adapter, message):
+    return adapter._get_or_create_heimdall_incident_thread(
+        "fingerprint",
+        message,
+        lambda: adapter._create_heimdall_incident_thread(message, name_source="Database alert"),
+    )
+
+
+def _adapter_with_store(state_path, client):
+    adapter = _adapter(_config())
+    adapter._heimdall_incident_store = HeimdallIncidentThreadStore(state_path)
+    adapter._client = client
+    return adapter
+
+
+def test_store_keeps_more_than_100_open_incidents_without_eviction(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    clock = iter(range(1, 1_000))
+    store = HeimdallIncidentThreadStore(state_path, now=lambda: float(next(clock)))
+
+    for index in range(150):
+        assert store.remember(f"fingerprint-{index}", _SCOPE, str(200000000000000000 + index))
+
+    restarted = HeimdallIncidentThreadStore(state_path)
+    assert restarted.is_healthy
+    assert restarted.get("fingerprint-0", _SCOPE)["thread_id"] == "200000000000000000"
+    assert len(json.loads(state_path.read_text(encoding="utf-8"))["incidents"]) == 150
+
+
+def test_store_loads_legacy_v1_state_and_validates_optional_fields(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    legacy = [
+        {"fingerprint": f"fp-{index}", "scope": _SCOPE, "thread_id": str(300 + index),
+         "lifecycle": "open", "updated_at": float(index)}
+        for index in range(100)
+    ]
+    legacy[0]["pending"] = True
+    legacy[1]["superseded_thread_ids"] = ["299"]
+    state_path.write_text(json.dumps({"version": 1, "incidents": legacy}), encoding="utf-8")
+
+    store = HeimdallIncidentThreadStore(state_path)
+    assert store.is_healthy
+    assert store.get("fp-0", _SCOPE)["pending"] is True
+    assert store.get("fp-99", _SCOPE)["thread_id"] == "399"
+
+    for bad in ({"pending": "yes"}, {"superseded_thread_ids": "299"}, {"superseded_thread_ids": [""]}):
+        broken = dict(legacy[2], **bad)
+        state_path.write_text(json.dumps({"version": 1, "incidents": [broken]}), encoding="utf-8")
+        assert HeimdallIncidentThreadStore(state_path).is_healthy is False
+
+
+def test_stale_store_instances_writing_different_keys_keep_both(tmp_path: Path):
+    """The ops-live lost update: two stale snapshots each add one key."""
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    first = HeimdallIncidentThreadStore(state_path)
+    second = HeimdallIncidentThreadStore(state_path)
+
+    assert first.remember("key-a", _SCOPE, "501")
+    assert second.remember("key-b", _SCOPE, "502")
+
+    restarted = HeimdallIncidentThreadStore(state_path)
+    assert restarted.get("key-a", _SCOPE)["thread_id"] == "501"
+    assert restarted.get("key-b", _SCOPE)["thread_id"] == "502"
+
+
+_WRITER_SCRIPT = """
+import sys, time
+from pathlib import Path
+from plugins.platforms.discord.adapter import HeimdallIncidentThreadStore
+path, prefix, go = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+scope = {"guild_id": "100000000000000001", "channel_id": "100000000000000002",
+         "webhook_id": "100000000000000004"}
+store = HeimdallIncidentThreadStore(path)
+while not go.exists():
+    time.sleep(0.005)
+for index in range(50):
+    assert store.remember(f"{prefix}-{index}", scope, str(400 + index)), index
+"""
+
+
+def test_two_processes_writing_different_keys_do_not_lose_updates(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    go = tmp_path / "go"
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ, PYTHONPATH=str(repo_root))
+    writers = [
+        subprocess.Popen(
+            [sys.executable, "-c", _WRITER_SCRIPT, str(state_path), prefix, str(go)],
+            cwd=repo_root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        for prefix in ("left", "right")
+    ]
+    time.sleep(0.5)
+    go.write_text("go", encoding="utf-8")
+    for writer in writers:
+        _out, err = writer.communicate(timeout=60)
+        assert writer.returncode == 0, err.decode()
+
+    store = HeimdallIncidentThreadStore(state_path)
+    keys = {incident["fingerprint"] for incident in store._incidents}
+    assert keys == {f"{prefix}-{index}" for prefix in ("left", "right") for index in range(50)}
+
+
+def test_store_io_error_is_not_an_empty_ledger(tmp_path: Path, monkeypatch):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    store = HeimdallIncidentThreadStore(state_path)
+    assert store.remember("fingerprint", _SCOPE, "505")
+    original = state_path.read_text(encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def failing_read_text(self, *args, **kwargs):
+        if self == state_path:
+            raise OSError("disk unavailable")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", failing_read_text)
+    adapter = _adapter(_config())
+    adapter._heimdall_incident_store = store
+    adapter._client = _FakeClient()
+    create = AsyncMock()
+
+    assert store.remember("other", _SCOPE, "506") is False
+    assert asyncio.run(adapter._get_or_create_heimdall_incident_thread(
+        "new-fingerprint", _alert(), create,
+    )) == (None, False)
+    create.assert_not_awaited()
+
+    monkeypatch.setattr(Path, "read_text", real_read_text)
+    assert state_path.read_text(encoding="utf-8") == original
+    assert store.is_healthy
+    assert store.remember("other", _SCOPE, "506")
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)["thread_id"] == "505"
+
+
+def test_claim_wait_is_bounded_and_does_not_pin_executor_threads(tmp_path: Path, monkeypatch):
+    """A claim held by another process neither blocks other keys nor waits forever."""
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    store = HeimdallIncidentThreadStore(state_path)
+    claim_key = discord_platform.hashlib.sha256(discord_platform.json.dumps(
+        {"fingerprint": "fingerprint", "scope": _SCOPE}, sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    holder = store._open_lock_file(claim_key)
+    discord_platform.fcntl.flock(holder.fileno(), discord_platform.fcntl.LOCK_EX)
+    monkeypatch.setattr(HeimdallIncidentThreadStore, "_CLAIM_LOCK_TIMEOUT_SECONDS", 0.5)
+    adapter = _adapter(_config())
+    adapter._heimdall_incident_store = store
+    adapter._client = _FakeClient()
+    create = AsyncMock()
+
+    async def scenario():
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        )
+        blocked = asyncio.ensure_future(adapter._get_or_create_heimdall_incident_thread(
+            "fingerprint", _alert(), create,
+        ))
+        await asyncio.sleep(0.05)
+        # The only executor thread is free: another key's update still lands.
+        assert await asyncio.wait_for(
+            asyncio.to_thread(store.remember, "other", _SCOPE, "506"), timeout=0.3,
+        )
+        return await asyncio.wait_for(blocked, timeout=2.0)
+
+    try:
+        assert asyncio.run(scenario()) == (None, False)
+    finally:
+        holder.close()
+    create.assert_not_awaited()
+    assert HeimdallIncidentThreadStore(state_path).get("other", _SCOPE)["thread_id"] == "506"
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        asyncio.TimeoutError(),
+        OSError(8, "nodename nor servname provided"),
+        aiohttp.ClientConnectionError("connect failed"),
+        _http_error(429),
+        _http_error(500),
+        _http_error(503),
+        _http_error(403, 50001),
+        _http_error(404, 10008),
+        RuntimeError("unexpected"),
+        None,
+    ],
+    ids=["timeout", "dns", "connection", "429", "500", "503", "403", "404-not-channel", "unknown", "no-client"],
+)
+def test_transient_lookup_errors_keep_mapping_and_defer(tmp_path: Path, error):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    HeimdallIncidentThreadStore(state_path).remember("fingerprint", _SCOPE, "505")
+    client = None if error is None else _FakeClient(errors={505: error})
+    adapter = _adapter_with_store(state_path, client)
+    create = AsyncMock()
+
+    assert asyncio.run(adapter._get_or_create_heimdall_incident_thread(
+        "fingerprint", _alert(), create,
+    )) == (None, False)
+    create.assert_not_awaited()
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)["thread_id"] == "505"
+
+
+def test_unknown_channel_supersedes_confirmed_thread_and_creates_once(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    HeimdallIncidentThreadStore(state_path).remember("fingerprint", _SCOPE, "505")
+    client = _FakeClient()
+    adapter = _adapter_with_store(state_path, client)
+    message = _starter(100000000000000020, client)
+
+    thread, reused = asyncio.run(_intake(adapter, message))
+
+    assert thread.id == message.id and reused is False
+    assert len(message.create_calls) == 1
+    incident = HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+    assert incident["thread_id"] == str(message.id)
+    assert incident["superseded_thread_ids"] == ["505"]
+    assert "pending" not in incident
+
+
+@pytest.mark.parametrize(
+    "error",
+    [asyncio.TimeoutError(), _http_error(400, 160004)],
+    ids=["timeout", "already-created-160004"],
+)
+def test_unclear_create_recovers_receipt_without_seed_fallback(tmp_path: Path, error):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    adapter = _adapter_with_store(state_path, client)
+    message = _starter(100000000000000020, client, error=error)
+    client.threads[message.id] = _thread(message.id)  # the request did land
+
+    thread, reused = asyncio.run(_intake(adapter, message))
+
+    assert thread.id == message.id and reused is False
+    assert len(message.create_calls) == 1
+    message.channel.send.assert_not_awaited()
+    incident = HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+    assert incident["thread_id"] == str(message.id) and "pending" not in incident
+
+
+def test_unknown_create_keeps_pending_through_404_until_late_completion(tmp_path: Path):
+    """A pending receipt plus 404 is not proof: the first request may land later."""
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    adapter = _adapter_with_store(state_path, client)
+    first = _starter(100000000000000020, client, error=asyncio.TimeoutError())
+
+    assert asyncio.run(_intake(adapter, first)) == (None, False)
+    incident = HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+    assert incident["thread_id"] == str(first.id) and incident["pending"] is True
+
+    # Next alert: the original id is still 404. No new starter, no new thread.
+    second = _starter(100000000000000021, client)
+    assert asyncio.run(_intake(_adapter_with_store(state_path, client), second)) == (None, False)
+    assert second.create_calls == []
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)["thread_id"] == str(first.id)
+
+    # The first request completes late; the next alert recovers that thread.
+    client.threads[first.id] = _thread(first.id)
+    third = _starter(100000000000000022, client)
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), third))
+    assert thread.id == first.id and reused is True
+    assert third.create_calls == []
+    incident = HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+    assert incident["thread_id"] == str(first.id) and "pending" not in incident
+
+
+def test_unknown_pending_receipt_is_never_superseded_by_unknown_channel(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    store = HeimdallIncidentThreadStore(state_path)
+    pending = store._record("fingerprint", _SCOPE, "100000000000000020", pending=True, superseded=[])
+    assert store.replace("fingerprint", _SCOPE, None, pending)
+    client = _FakeClient()  # every fetch is Unknown Channel
+    message = _starter(100000000000000021, client)
+
+    assert asyncio.run(_intake(_adapter_with_store(state_path, client), message)) == (None, False)
+    assert message.create_calls == []
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)["pending"] is True
+
+
+def test_definitive_create_rejection_cleans_up_or_restores_previous_record(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    rejected = _http_error(403, 50013)
+
+    # MISSING: the pending receipt is removed again.
+    message = _starter(100000000000000020, client, error=rejected)
+    assert asyncio.run(_intake(_adapter_with_store(state_path, client), message)) == (None, False)
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE) is None
+    assert client.fetches == []
+
+    # GONE: the confirmed record and its lineage are restored exactly.
+    HeimdallIncidentThreadStore(state_path).remember("fingerprint", _SCOPE, "505")
+    before = HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+    message = _starter(100000000000000021, client, error=rejected)
+    assert asyncio.run(_intake(_adapter_with_store(state_path, client), message)) == (None, False)
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE) == before
+
+
+def test_failed_restore_after_rejection_is_not_success(tmp_path: Path, monkeypatch):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    adapter = _adapter_with_store(state_path, client)
+    store = adapter._heimdall_incident_store
+    real_replace = HeimdallIncidentThreadStore.replace
+    calls = []
+
+    def replace(self, *args):
+        calls.append(args)
+        return real_replace(self, *args) if len(calls) == 1 else False
+
+    monkeypatch.setattr(HeimdallIncidentThreadStore, "replace", replace)
+    message = _starter(
+        100000000000000020, client,
+        error=_http_error(403, 50013),
+    )
+
+    assert asyncio.run(_intake(adapter, message)) == (None, False)
+    assert len(calls) == 2
+    assert store.get("fingerprint", _SCOPE)["pending"] is True
+
+
+def test_create_success_then_confirm_failure_recovers_same_thread_after_restart(
+    tmp_path: Path, monkeypatch,
+):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    adapter = _adapter_with_store(state_path, client)
+    real_replace = HeimdallIncidentThreadStore.replace
+    calls = []
+
+    def replace(self, *args):
+        calls.append(args)
+        return real_replace(self, *args) if len(calls) == 1 else False
+
+    monkeypatch.setattr(HeimdallIncidentThreadStore, "replace", replace)
+    first = _starter(100000000000000020, client)
+    thread, reused = asyncio.run(_intake(adapter, first))
+    assert thread.id == first.id and reused is False
+    monkeypatch.setattr(HeimdallIncidentThreadStore, "replace", real_replace)
+    assert HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)["pending"] is True
+
+    second = _starter(100000000000000021, client)
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), second))
+    assert thread.id == first.id and reused is True
+    assert second.create_calls == [] and len(first.create_calls) == 1
+    assert "pending" not in HeimdallIncidentThreadStore(state_path).get("fingerprint", _SCOPE)
+
+
+def test_restart_reopen_reuses_archived_incident_thread(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    first = _starter(100000000000000020, client)
+    asyncio.run(_intake(_adapter_with_store(state_path, client), first))
+    client.threads[first.id].archived = True
+
+    repeat = _starter(100000000000000021, client)
+    thread, reused = asyncio.run(_intake(_adapter_with_store(state_path, client), repeat))
+
+    assert thread.id == first.id and reused is True
+    assert repeat.create_calls == []
+
+
+def test_burst_of_35_distinct_incidents_across_two_adapters_all_survive_restart(tmp_path: Path):
+    state_path = tmp_path / "discord_heimdall_incidents.json"
+    client = _FakeClient()
+    adapters = [_adapter_with_store(state_path, client) for _ in range(2)]
+    messages = [_starter(100000000000000100 + index, client) for index in range(35)]
+
+    async def burst():
+        return await asyncio.wait_for(asyncio.gather(*(
+            adapters[index % 2]._get_or_create_heimdall_incident_thread(
+                f"fingerprint-{index}",
+                message,
+                lambda message=message, adapter=adapters[index % 2]: adapter._create_heimdall_incident_thread(
+                    message, name_source="burst",
+                ),
+            )
+            for index, message in enumerate(messages)
+        )), timeout=10)
+
+    results = asyncio.run(burst())
+
+    assert [thread.id for thread, _reused in results] == [message.id for message in messages]
+    assert sum(len(message.create_calls) for message in messages) == 35
+    restarted = HeimdallIncidentThreadStore(state_path)
+    for index, message in enumerate(messages):
+        incident = restarted.get(f"fingerprint-{index}", _SCOPE)
+        assert incident["thread_id"] == str(message.id) and "pending" not in incident

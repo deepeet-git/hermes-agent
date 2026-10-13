@@ -28,7 +28,7 @@ import weakref
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path, Path as _Path
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
 try:
@@ -168,17 +168,52 @@ _DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS = (
 )
 
 
-class HeimdallIncidentThreadStore:
-    """Profile-local, bounded durable mapping for open Heimdall incidents."""
+_HEIMDALL_LOOKUP_MISSING = "missing"
+_HEIMDALL_LOOKUP_FOUND = "found"
+_HEIMDALL_LOOKUP_DEFER = "defer"
+_HEIMDALL_LOOKUP_GONE = "gone"
+_HEIMDALL_CREATE_CREATED = "created"
+_HEIMDALL_CREATE_ABSENT = "absent"
+_HEIMDALL_CREATE_DEFER = "defer"
 
-    _MAX_INCIDENTS = 100
+
+class _HeimdallThreadLookup(NamedTuple):
+    kind: str
+    thread: Optional[Any]
+    incident: Optional[dict[str, Any]]
+
+
+class _HeimdallCreateResult(NamedTuple):
+    kind: str
+    thread: Optional[Any]
+
+
+class HeimdallIncidentStoreUnavailable(Exception):
+    """The durable incident state could not be read or written right now."""
+
+
+class HeimdallIncidentThreadStore:
+    """Profile-local durable correlation from Heimdall incident to thread.
+
+    Gateway has no incident-resolution signal, so records are never evicted by
+    count or age: dropping one would let a repeated alert open a second thread.
+    Every mutation re-reads the latest file under a store-wide cross-process
+    lock (a leaf lock: no network I/O, awaits, or other locks while held), so
+    adapters writing different incidents cannot overwrite each other.
+    """
+
     _VERSION = 1
     _SCOPE_KEYS = ("guild_id", "channel_id", "webhook_id")
+    _MAX_SUPERSEDED_THREAD_IDS = 10
+    _LARGE_STATE_WARNING = 2_000
+    _STORE_LOCK_TIMEOUT_SECONDS = 10.0
+    _CLAIM_LOCK_TIMEOUT_SECONDS = 30.0
 
     def __init__(self, state_path: Path, *, now: Callable[[], float] = time.time) -> None:
         self._path = state_path
         self._now = now
         self._corrupt = False
+        self._warned_large = False
         self._incidents: list[dict[str, Any]] = self._load()
 
     @classmethod
@@ -195,7 +230,7 @@ class HeimdallIncidentThreadStore:
 
     @classmethod
     def _valid_incident(cls, incident: Any) -> bool:
-        return (
+        if not (
             isinstance(incident, dict)
             and isinstance(incident.get("fingerprint"), str)
             and bool(incident["fingerprint"])
@@ -205,25 +240,59 @@ class HeimdallIncidentThreadStore:
             and incident.get("lifecycle") in {"open", "resolved"}
             and isinstance(incident.get("updated_at"), (int, float))
             and math.isfinite(incident["updated_at"])
+        ):
+            return False
+        # Optional fields: ``pending`` marks a starter message whose thread
+        # creation outcome is not confirmed yet; ``superseded_thread_ids`` keeps
+        # the audit lineage of confirmed threads Discord reported as deleted.
+        if "pending" in incident and not isinstance(incident["pending"], bool):
+            return False
+        superseded = incident.get("superseded_thread_ids", [])
+        return isinstance(superseded, list) and all(
+            isinstance(thread_id, str) and thread_id for thread_id in superseded
         )
 
-    def _load(self) -> list[dict[str, Any]]:
-        if not self._path.exists():
-            return []
+    def _load_strict(self) -> list[dict[str, Any]]:
+        """Read the latest state; raise instead of treating failure as empty.
+
+        A missing file is the only empty state. ``OSError`` raises
+        ``HeimdallIncidentStoreUnavailable`` for this attempt only; invalid
+        content marks the store corrupt until an operator repairs it.
+        """
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
+            raw = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            logger.warning("Could not read Heimdall incident state %s: %s", self._path, exc)
+            raise HeimdallIncidentStoreUnavailable(str(exc)) from exc
+        try:
+            data = json.loads(raw)
             incidents = data.get("incidents") if isinstance(data, dict) else None
             if (
                 data.get("version") != self._VERSION
                 or not isinstance(incidents, list)
-                or len(incidents) > self._MAX_INCIDENTS
                 or not all(self._valid_incident(incident) for incident in incidents)
             ):
                 raise ValueError("invalid Heimdall incident state")
-            return incidents
         except Exception as exc:
             self._corrupt = True
             logger.warning("Refusing corrupt Heimdall incident state %s: %s", self._path, exc)
+            raise HeimdallIncidentStoreUnavailable("corrupt Heimdall incident state") from exc
+        if len(incidents) > self._LARGE_STATE_WARNING and not self._warned_large:
+            self._warned_large = True
+            logger.warning(
+                "Heimdall incident state %s holds %d records; no retention is applied",
+                self._path, len(incidents),
+            )
+        return incidents
+
+    def _load(self) -> list[dict[str, Any]]:
+        try:
+            return self._load_strict()
+        except HeimdallIncidentStoreUnavailable:
+            # Corrupt content is sticky; a transient read error leaves the
+            # cache empty, but every claim re-reads strictly before routing.
             return []
 
     @staticmethod
@@ -234,7 +303,7 @@ class HeimdallIncidentThreadStore:
         if self._corrupt or not self._valid_scope(scope):
             return None
         for incident in self._incidents:
-            if self._matches(incident, fingerprint, scope) and incident["lifecycle"] == "open":
+            if self._matches(incident, fingerprint, scope):
                 return dict(incident)
         return None
 
@@ -242,29 +311,36 @@ class HeimdallIncidentThreadStore:
         """Refresh state while an incident claim is held by this process."""
         if self._corrupt:
             return False
-        self._incidents = self._load()
-        return not self._corrupt
-
-    def _acquire_claim_file_lock(self, claim_key: str) -> Optional[Any]:
-        """Open and acquire the per-incident cross-process lock off-loop."""
-        handle = None
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            lock_path = self._path.with_name(f".{self._path.name}.{claim_key}.lock")
-            handle = lock_path.open("a+", encoding="utf-8")
+            self._incidents = self._load_strict()
+        except HeimdallIncidentStoreUnavailable:
+            return False
+        return True
+
+    @staticmethod
+    def _try_lock(handle: Any) -> bool:
+        """Try one non-blocking exclusive lock; ``False`` means it is held."""
+        try:
             if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             elif msvcrt is not None:  # pragma: no cover - Windows
-                getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)
             else:  # pragma: no cover - unsupported platforms
-                logger.warning("No process-shared Heimdall incident lock is available")
-                handle.close()
-                return None
-            return handle
+                raise OSError("No process-shared Heimdall incident lock is available")
+        except (BlockingIOError, PermissionError):
+            return False
+        return True
+
+    def _open_lock_file(self, suffix: str) -> Any:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        return self._path.with_name(f".{self._path.name}.{suffix}.lock").open("a+", encoding="utf-8")
+
+    def _open_claim_file_lock(self, claim_key: str) -> Optional[Any]:
+        """Open the per-incident cross-process lock file off-loop."""
+        try:
+            return self._open_lock_file(claim_key)
         except Exception as exc:
             logger.warning("Could not claim Heimdall incident state %s: %s", self._path, exc)
-            if handle is not None:
-                handle.close()
             return None
 
     @staticmethod
@@ -280,15 +356,41 @@ class HeimdallIncidentThreadStore:
 
     @asynccontextmanager
     async def claim(self, fingerprint: str, scope: dict[str, str]):
-        """Claim one fingerprint and scope across adapters and processes."""
+        """Claim one fingerprint and scope across adapters and processes.
+
+        The wait polls a non-blocking lock with ``asyncio.sleep`` so a claim
+        held by another process never pins an executor thread, and it is
+        bounded: a timeout yields ``False`` and the caller defers the alert.
+        """
         if self._corrupt or not fingerprint or not self._valid_scope(scope):
             yield False
             return
         claim_key = hashlib.sha256(json.dumps(
             {"fingerprint": fingerprint, "scope": scope}, sort_keys=True,
         ).encode("utf-8")).hexdigest()
-        handle = await asyncio.to_thread(self._acquire_claim_file_lock, claim_key)
+        handle = await asyncio.to_thread(self._open_claim_file_lock, claim_key)
         if handle is None:
+            yield False
+            return
+        locked = False
+        try:
+            deadline = time.monotonic() + self._CLAIM_LOCK_TIMEOUT_SECONDS
+            delay = 0.005
+            while True:
+                try:
+                    locked = self._try_lock(handle)
+                except Exception as exc:
+                    logger.warning("Could not claim Heimdall incident state %s: %s", self._path, exc)
+                    break
+                if locked or time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 0.25)
+        finally:
+            if not locked:
+                handle.close()
+        if not locked:
+            logger.warning("Deferring Heimdall incident claimed elsewhere: %s", self._path)
             yield False
             return
         try:
@@ -304,36 +406,114 @@ class HeimdallIncidentThreadStore:
         """Whether the durable state was loaded without a validation failure."""
         return not self._corrupt
 
-    def _write(self, incidents: list[dict[str, Any]]) -> bool:
+    def _mutate(
+        self, change: Callable[[list[dict[str, Any]]], Optional[list[dict[str, Any]]]],
+    ) -> bool:
+        """Apply ``change`` to the latest state under the store-wide lock.
+
+        Synchronous and short: run it off-loop in one ``asyncio.to_thread``
+        call. ``change`` must not block, await, or take another lock. It
+        returns the new incident list, or ``None`` to refuse the change.
+        """
         if self._corrupt:
             return False
         try:
-            atomic_json_write(self._path, {"version": self._VERSION, "incidents": incidents})
+            handle = self._open_lock_file("store")
         except Exception as exc:
-            logger.warning("Could not persist Heimdall incident state %s: %s", self._path, exc)
+            logger.warning("Could not lock Heimdall incident state %s: %s", self._path, exc)
             return False
-        self._incidents = incidents
-        return True
+        try:
+            deadline = time.monotonic() + self._STORE_LOCK_TIMEOUT_SECONDS
+            while not self._try_lock(handle):
+                if time.monotonic() >= deadline:
+                    logger.warning("Timed out locking Heimdall incident state %s", self._path)
+                    return False
+                time.sleep(0.005)
+            try:
+                latest = self._load_strict()
+            except HeimdallIncidentStoreUnavailable:
+                return False
+            incidents = change([dict(incident) for incident in latest])
+            if incidents is None:
+                return False
+            try:
+                atomic_json_write(self._path, {"version": self._VERSION, "incidents": incidents})
+            except Exception as exc:
+                logger.warning("Could not persist Heimdall incident state %s: %s", self._path, exc)
+                return False
+            self._incidents = incidents
+            return True
+        except Exception as exc:
+            logger.warning("Could not update Heimdall incident state %s: %s", self._path, exc)
+            return False
+        finally:
+            self._release_claim_file_lock(handle)
 
-    def remember(self, fingerprint: str, scope: dict[str, str], thread_id: str) -> bool:
-        if self._corrupt or not fingerprint or not self._valid_scope(scope) or not thread_id:
-            return False
-        incidents = [incident for incident in self._incidents if not self._matches(incident, fingerprint, scope)]
-        incidents.append({
+    def _record(
+        self, fingerprint: str, scope: dict[str, str], thread_id: str, *,
+        pending: bool, superseded: list[str],
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
             "fingerprint": fingerprint,
             "scope": dict(scope),
             "thread_id": str(thread_id),
             "lifecycle": "open",
             "updated_at": self._now(),
-        })
-        incidents = sorted(incidents, key=lambda incident: incident["updated_at"])[-self._MAX_INCIDENTS:]
-        return self._write(incidents)
+        }
+        if pending:
+            record["pending"] = True
+        if superseded:
+            record["superseded_thread_ids"] = superseded[-self._MAX_SUPERSEDED_THREAD_IDS:]
+        return record
+
+    def replace(
+        self,
+        fingerprint: str,
+        scope: dict[str, str],
+        expected: Optional[dict[str, Any]],
+        replacement: Optional[dict[str, Any]],
+    ) -> bool:
+        """Compare-and-set one incident record against the latest state."""
+        if self._corrupt or not fingerprint or not self._valid_scope(scope):
+            return False
+        if replacement is not None and not self._valid_incident(replacement):
+            return False
+
+        def change(incidents: list[dict[str, Any]]) -> Optional[list[dict[str, Any]]]:
+            current = next(
+                (incident for incident in incidents if self._matches(incident, fingerprint, scope)),
+                None,
+            )
+            if current != expected:
+                logger.warning("Refusing concurrent Heimdall incident state change %s", self._path)
+                return None
+            kept = [incident for incident in incidents if not self._matches(incident, fingerprint, scope)]
+            return kept + ([replacement] if replacement is not None else [])
+
+        return self._mutate(change)
+
+    def remember(self, fingerprint: str, scope: dict[str, str], thread_id: str) -> bool:
+        if self._corrupt or not fingerprint or not self._valid_scope(scope) or not thread_id:
+            return False
+
+        def change(incidents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            current = next(
+                (incident for incident in incidents if self._matches(incident, fingerprint, scope)),
+                None,
+            )
+            superseded = list((current or {}).get("superseded_thread_ids", []))
+            kept = [incident for incident in incidents if not self._matches(incident, fingerprint, scope)]
+            return kept + [self._record(
+                fingerprint, scope, thread_id, pending=False, superseded=superseded,
+            )]
+
+        return self._mutate(change)
 
     def forget(self, fingerprint: str, scope: dict[str, str]) -> bool:
         if self._corrupt or not self._valid_scope(scope):
             return False
-        return self._write([
-            incident for incident in self._incidents
+        return self._mutate(lambda incidents: [
+            incident for incident in incidents
             if not self._matches(incident, fingerprint, scope)
         ])
 
@@ -1896,33 +2076,112 @@ class DiscordAdapter(BasePlatformAdapter):
             "webhook_id": str(config["webhook_id"]),
         }
 
-    async def _resolve_heimdall_incident_thread(
+    def _heimdall_thread_in_scope(self, thread: Any, scope: dict[str, str]) -> bool:
+        return (
+            thread is not None
+            and str(getattr(thread, "parent_id", "")) == scope["channel_id"]
+            and str(getattr(getattr(thread, "guild", None), "id", "")) == scope["guild_id"]
+        )
+
+    @staticmethod
+    def _heimdall_http_error(exc: BaseException) -> tuple[Optional[int], int]:
+        """Return Discord's HTTP status and JSON error code, if any."""
+        http_exception = getattr(discord, "HTTPException", None) if discord is not None else None
+        if not isinstance(http_exception, type) or not isinstance(exc, http_exception):
+            return None, 0
+        status = getattr(exc, "status", None)
+        code = getattr(exc, "code", 0)
+        return (status if isinstance(status, int) else None), (code if isinstance(code, int) else 0)
+
+    async def _lookup_heimdall_incident_thread(
         self, fingerprint: str, message: Any,
-    ) -> Optional[Any]:
-        """Fetch and validate a persisted incident thread before reusing it."""
+    ) -> _HeimdallThreadLookup:
+        """Classify the persisted incident thread without changing the mapping.
+
+        Only Discord's definitive Unknown Channel for a confirmed thread is
+        ``GONE``. Timeouts, DNS, 429, 5xx, 403, unknown errors, a wrong parent
+        or guild, and any 404 for an unconfirmed (pending) starter are
+        ``DEFER``: the mapping is kept and no new thread may be created.
+        """
         scope = self._heimdall_incident_scope()
-        if not fingerprint or scope is None:
-            return None
-        incident = self._heimdall_incident_store.get(fingerprint, scope)
+        store = getattr(self, "_heimdall_incident_store", None)
+        if not fingerprint or scope is None or store is None:
+            return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_DEFER, None, None)
+        incident = store.get(fingerprint, scope)
         if incident is None:
-            return None
+            if not store.is_healthy:
+                return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_DEFER, None, None)
+            return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_MISSING, None, None)
+        thread_id = incident["thread_id"]
         try:
             # Do not trust an adapter cache across a gateway restart: fetch the
             # current Discord object and check its parent and guild again.
             if self._client is None:
                 raise RuntimeError("Discord client unavailable")
-            thread = await self._client.fetch_channel(int(incident["thread_id"]))
-            if (
-                thread is None
-                or str(getattr(thread, "parent_id", "")) != scope["channel_id"]
-                or str(getattr(getattr(thread, "guild", None), "id", "")) != scope["guild_id"]
-            ):
-                raise ValueError("missing or wrong-parent incident thread")
-            return thread
+            thread = await self._client.fetch_channel(int(thread_id))
         except Exception as exc:
-            logger.warning("Discarding stale Heimdall incident thread %s: %s", incident["thread_id"], exc)
-            self._heimdall_incident_store.forget(fingerprint, scope)
-            return None
+            status, code = self._heimdall_http_error(exc)
+            if status == 404 and code == 10003 and not incident.get("pending"):
+                logger.warning("Heimdall incident thread %s was deleted on Discord", thread_id)
+                return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_GONE, None, incident)
+            logger.warning("Deferring Heimdall incident thread %s lookup: %s", thread_id, exc)
+            return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_DEFER, None, incident)
+        if not self._heimdall_thread_in_scope(thread, scope):
+            logger.error(
+                "Deferring Heimdall incident: thread %s is missing or outside its parent",
+                thread_id,
+            )
+            return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_DEFER, None, incident)
+        return _HeimdallThreadLookup(_HEIMDALL_LOOKUP_FOUND, thread, incident)
+
+    async def _resolve_heimdall_incident_thread(
+        self, fingerprint: str, message: Any,
+    ) -> Optional[Any]:
+        """Return the verified persisted incident thread, or ``None``."""
+        lookup = await self._lookup_heimdall_incident_thread(fingerprint, message)
+        return lookup.thread if lookup.kind == _HEIMDALL_LOOKUP_FOUND else None
+
+    async def _create_heimdall_incident_thread(
+        self, message: Any, *, name_source: str,
+    ) -> _HeimdallCreateResult:
+        """Start the incident thread on the alert itself, exactly once.
+
+        Unlike ``_auto_create_thread`` there is no seed-message fallback and no
+        retry: a thread started from a message has that message's id, so the
+        alert id is the creation receipt. An unclear failure (timeout, 429,
+        5xx, network, or 160004 "thread already created") is recovered by
+        fetching that id; only a definitive 4xx proves nothing was created.
+        """
+        thread_name = self._derive_auto_thread_name(name_source)
+        try:
+            thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+        except Exception as exc:
+            status, code = self._heimdall_http_error(exc)
+            if (
+                status is not None and 400 <= status < 500
+                and status != 429 and code != 160004
+            ):
+                logger.warning("Discord rejected Heimdall incident thread creation: %s", exc)
+                return _HeimdallCreateResult(_HEIMDALL_CREATE_ABSENT, None)
+            logger.warning("Heimdall incident thread creation outcome unknown: %s", exc)
+            scope = self._heimdall_incident_scope()
+            try:
+                if self._client is None or scope is None:
+                    raise RuntimeError("Discord client unavailable")
+                thread = await self._client.fetch_channel(int(message.id))
+            except Exception as receipt_exc:
+                # Even a 404 here is not proof: the first request may still
+                # complete. Keep the pending receipt and defer.
+                logger.warning("Could not confirm Heimdall incident thread receipt: %s", receipt_exc)
+                return _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
+            if not self._heimdall_thread_in_scope(thread, scope):
+                logger.error("Heimdall incident thread receipt is outside its parent")
+                return _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
+        try:
+            setattr(thread, "_hermes_auto_thread_initial_name", thread_name)
+        except Exception:
+            pass
+        return _HeimdallCreateResult(_HEIMDALL_CREATE_CREATED, thread)
 
     async def _get_or_create_heimdall_incident_thread(
         self,
@@ -1930,7 +2189,12 @@ class DiscordAdapter(BasePlatformAdapter):
         message: Any,
         create_thread: Callable[[], Any],
     ) -> tuple[Optional[Any], bool]:
-        """Atomically resolve one incident thread and report whether it was reused."""
+        """Atomically resolve one incident thread and report whether it was reused.
+
+        The alert's own message id is persisted as a pending receipt before the
+        single create call, so a lost response, crash, or failed confirmation
+        is recovered from that id instead of creating another thread.
+        """
         scope = self._heimdall_incident_scope()
         store = getattr(self, "_heimdall_incident_store", None)
         if (
@@ -1943,20 +2207,66 @@ class DiscordAdapter(BasePlatformAdapter):
         claim_lock = _heimdall_incident_claim_lock(store._path, fingerprint, scope)
         async with claim_lock:
             async with store.claim(fingerprint, scope) as claimed:
-                if not claimed or not store.reread():
+                if not claimed or not await asyncio.to_thread(store.reread):
                     return None, False
-                existing = await self._resolve_heimdall_incident_thread(fingerprint, message)
-                if existing is not None:
-                    self._threads.mark(str(existing.id))
-                    return existing, True
-                if not store.is_healthy:
+                lookup = await self._lookup_heimdall_incident_thread(fingerprint, message)
+                if lookup.kind == _HEIMDALL_LOOKUP_FOUND:
+                    if lookup.incident and lookup.incident.get("pending"):
+                        confirmed = dict(lookup.incident)
+                        confirmed.pop("pending", None)
+                        confirmed["updated_at"] = store._now()
+                        if not await asyncio.to_thread(
+                            store.replace, fingerprint, scope, lookup.incident, confirmed,
+                        ):
+                            logger.warning("Could not confirm recovered Heimdall incident thread")
+                    self._threads.mark(str(lookup.thread.id))
+                    return lookup.thread, True
+                if lookup.kind not in {_HEIMDALL_LOOKUP_MISSING, _HEIMDALL_LOOKUP_GONE}:
                     return None, False
-                thread = await create_thread()
-                if thread is None:
+                starter_id = str(getattr(message, "id", "") or "")
+                if not starter_id.isdigit():
+                    logger.warning("Refusing Heimdall incident thread without a starter message id")
                     return None, False
-                if not store.remember(fingerprint, scope, str(thread.id)):
-                    logger.warning("Refusing unpersisted Heimdall incident thread")
+                previous = lookup.incident
+                superseded = list((previous or {}).get("superseded_thread_ids", []))
+                if previous is not None:
+                    superseded.append(previous["thread_id"])
+                pending = store._record(
+                    fingerprint, scope, starter_id, pending=True, superseded=superseded,
+                )
+                if not await asyncio.to_thread(store.replace, fingerprint, scope, previous, pending):
+                    logger.warning("Refusing Heimdall incident thread without a durable receipt")
                     return None, False
+                try:
+                    result = await create_thread()
+                except Exception as exc:
+                    logger.warning("Heimdall incident thread creation outcome unknown: %s", exc)
+                    result = _HeimdallCreateResult(_HEIMDALL_CREATE_DEFER, None)
+                if not isinstance(result, _HeimdallCreateResult):
+                    result = _HeimdallCreateResult(
+                        _HEIMDALL_CREATE_CREATED if result is not None else _HEIMDALL_CREATE_DEFER,
+                        result,
+                    )
+                if result.kind == _HEIMDALL_CREATE_ABSENT:
+                    # Discord proved nothing was created: put back exactly what
+                    # was there. A failed restore is still a failure; the pending
+                    # receipt stays and later alerts defer on it.
+                    if not await asyncio.to_thread(store.replace, fingerprint, scope, pending, previous):
+                        logger.error("Could not restore Heimdall incident state after rejection")
+                    return None, False
+                if result.kind != _HEIMDALL_CREATE_CREATED or result.thread is None:
+                    return None, False
+                thread = result.thread
+                confirmed = store._record(
+                    fingerprint, scope, str(thread.id), pending=False, superseded=superseded,
+                )
+                if not await asyncio.to_thread(store.replace, fingerprint, scope, pending, confirmed):
+                    if str(thread.id) != starter_id:
+                        logger.error("Refusing unpersisted Heimdall incident thread")
+                        return None, False
+                    # The pending receipt already names this thread; the next
+                    # alert fetches it and confirms.
+                    logger.warning("Could not confirm Heimdall incident thread; receipt kept")
                 self._threads.mark(str(thread.id))
                 # Match generic auto-thread handling: Discord can emit the
                 # new thread's starter message as a second default event with
@@ -8411,7 +8721,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_threaded_channel, reused_heimdall_thread = await self._get_or_create_heimdall_incident_thread(
                 heimdall_fingerprint,
                 message,
-                lambda: self._auto_create_thread(message, name_source=heimdall_text),
+                lambda: self._create_heimdall_incident_thread(message, name_source=heimdall_text),
             )
             if auto_threaded_channel is None:
                 return False
