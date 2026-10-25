@@ -50,6 +50,11 @@ _TOOL_CAPABILITY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_INTERNAL_SOURCE_RE = re.compile(
+    r"(?=.*(?:우리|디핏|deepeet))(?=.*(?:로직|콘솔|구현|프로세스|적용|코드|계약))",
+    re.IGNORECASE,
+)
+
 _CONVERSATIONAL_RE = re.compile(
     r"(?:"
     r"안\s*되네|안되네|느리네|여전하|그대로네|맞네|맞아|아니네|아니야|"
@@ -87,12 +92,13 @@ def should_use_lean_chat_fast_path(message: Any) -> bool:
         return False
     if len(text) <= 18 and _TERSE_OPERATOR_RE.search(text):
         return False
-    if _CONVERSATIONAL_RE.search(text):
-        return True
     if _LIVE_STATE_RE.search(text):
         return False
-    if _MUTABLE_SOURCE_RE.search(text) or _TOOL_CAPABILITY_RE.search(text):
+    if (_MUTABLE_SOURCE_RE.search(text) or _TOOL_CAPABILITY_RE.search(text)
+            or _INTERNAL_SOURCE_RE.search(text)):
         return False
+    if _CONVERSATIONAL_RE.search(text):
+        return True
     return bool(text.endswith("?") and len(text) <= 120)
 
 

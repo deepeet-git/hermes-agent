@@ -56,6 +56,12 @@ def test_same_chain_deduplicated_in_owner(tmp_path, monkeypatch):
     rows = [_row(f"a{i}", "account-a", "one-chain") for i in range(3)]
     rows.append(_row("seed", "account-a", "one-chain", source="device_code"))
     root, profile = _setup(tmp_path, monkeypatch, rows)
+    # Deduplication deletes rows, so exercise it as the root owner rather
+    # than granting a borrowing profile authority over root's lifecycle.
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    # Explicit temporary root home, distinct from the synthetic platform
+    # default so the real-user-store test seat belt remains enabled.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "owner-home")
     pool = CP.load_pool("openai-codex")
     assert [entry.id for entry in pool.entries()] == ["seed"]
     assert len(json.loads((root / "auth.json").read_text())["credential_pool"]["openai-codex"]) == 1
@@ -67,6 +73,12 @@ def test_new_login_replaces_same_account_without_touching_other_account(tmp_path
         _row("old", "account-a", "old-chain"),
         _row("other", "account-b", "other-chain"),
     ])
+    # An explicit owner re-login may replace its account. A borrower's
+    # explicit login is independently covered as profile-local instead.
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    # Explicit temporary root home, distinct from the synthetic platform
+    # default so the real-user-store test seat belt remains enabled.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "owner-home")
     pool = CP.load_pool("openai-codex")
     added = pool.add_entry(CP.PooledCredential.from_dict("openai-codex", _row(
         "new", "account-a", "new-chain")))

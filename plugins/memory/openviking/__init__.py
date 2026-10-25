@@ -50,7 +50,8 @@ from urllib.parse import quote, unquote, urlparse
 from urllib.request import url2pathname
 
 from agent.message_content import flatten_message_text
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, ctx_bound
+from agent.secret_scope import get_secret
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 from utils import atomic_json_write, env_var_enabled
@@ -295,9 +296,9 @@ class _VikingClient:
         # Account/user are local/trusted-mode tenant identity. API-key requests
         # omit these headers by default; trusted-mode retry may send them only
         # after OpenViking explicitly asks for asserted tenant identity.
-        self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
-        self._user = user or os.environ.get("OPENVIKING_USER", "default")
-        self._agent = agent if agent is not None else os.environ.get("OPENVIKING_AGENT", _DEFAULT_AGENT)
+        self._account = account or get_secret("OPENVIKING_ACCOUNT", "default")
+        self._user = user or get_secret("OPENVIKING_USER", "default")
+        self._agent = agent if agent is not None else get_secret("OPENVIKING_AGENT", _DEFAULT_AGENT)
         self._httpx = _get_httpx()
         if self._httpx is None:
             raise ImportError("httpx is required for OpenViking: pip install httpx")
@@ -1076,7 +1077,8 @@ def _load_hermes_openviking_config() -> dict:
 
 
 def _env_value(name: str) -> Optional[str]:
-    return os.environ[name].strip() if name in os.environ else None
+    value = get_secret(name)
+    return value.strip() if value is not None else None
 
 
 def _first_nonempty(*values: Optional[str], default: str = "") -> str:
@@ -2515,7 +2517,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if self._runtime_start_thread and self._runtime_start_thread.is_alive():
             return
         self._runtime_start_thread = threading.Thread(
-            target=self._finish_runtime_openviking_start,
+            target=ctx_bound(self._finish_runtime_openviking_start),
             kwargs={
                 "endpoint": endpoint,
                 "status_callback": status_callback,
@@ -3083,7 +3085,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         if not workers:
                             self._inflight_writers.pop(sid, None)
 
-        thread = threading.Thread(target=_wrapped, daemon=True, name=name)
+        thread = threading.Thread(target=ctx_bound(_wrapped), daemon=True, name=name)
         holder.append(thread)
         with self._inflight_lock:
             self._inflight_writers.setdefault(sid, set()).add(thread)
@@ -3485,7 +3487,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                             self._deferred_commit_threads.discard(holder[0])
 
             thread = threading.Thread(
-                target=_recover_owner,
+                target=ctx_bound(_recover_owner),
                 daemon=True,
                 name=f"openviking-recover-owner-{owner_run_id or 'legacy'}",
             )
@@ -3569,7 +3571,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         self._deferred_commit_threads.discard(holder[0])
 
         thread = threading.Thread(
-            target=_finalize,
+            target=ctx_bound(_finalize),
             daemon=True,
             name=f"openviking-finalize-{sid}",
         )
@@ -4971,7 +4973,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 with self._memory_write_lock:
                     self._memory_write_threads.discard(threading.current_thread())
 
-        t = threading.Thread(target=_write, daemon=True, name="openviking-memwrite")
+        t = threading.Thread(target=ctx_bound(_write), daemon=True, name="openviking-memwrite")
         with self._memory_write_lock:
             if self._shutting_down:
                 return

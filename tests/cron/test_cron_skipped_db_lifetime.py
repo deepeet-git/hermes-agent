@@ -9,9 +9,13 @@ def test_skipped_ticks_do_not_construct_session_db(monkeypatch, mode):
     db_factory = MagicMock()
     monkeypatch.setattr(hermes_state, "SessionDB", db_factory)
     job = {"id": "test_skipped", "name": "skip regression", "prompt": "test", "deliver": "local"}
+    # Exercise the canonical execution body after owner admission, not a
+    # nonexistent persisted job in the new authority dispatcher.
+    monkeypatch.setattr("gateway.session_cron.current_execution",
+                        lambda: ("test-owner", "test-session", job["id"], None))
     if mode == "wake_false":
         job["script"] = "gate.py"
-        monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat", lambda *a: (True, '{"wakeAgent": false}'))
+        monkeypatch.setattr(scheduler, "_run_job_script_with_claim_heartbeat", lambda *a, **kw: (True, '{"wakeAgent": false}'))
     elif mode == "empty_prompt":
         monkeypatch.setattr(scheduler, "_build_job_prompt", lambda *a, **kw: None)
     else:

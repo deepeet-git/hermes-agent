@@ -7,6 +7,10 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
 
 
+class AdapterFake(SimpleNamespace):
+    """Native adapter stand-in that supports weak transport provenance."""
+
+
 def _runner(policy, *, verified_parent=False):
     from gateway.run import GatewayRunner
 
@@ -19,7 +23,7 @@ def _runner(policy, *, verified_parent=False):
             )
         }
     )
-    adapter = SimpleNamespace(
+    adapter = AdapterFake(
         config=runner.config.platforms[Platform.DISCORD],
         verified_parent_chat_id=(
             lambda source: source.parent_chat_id if verified_parent else None

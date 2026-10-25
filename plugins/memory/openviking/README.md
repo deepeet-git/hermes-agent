@@ -2,6 +2,24 @@
 
 Context database by Volcengine (ByteDance) with filesystem-style knowledge hierarchy, tiered retrieval, and automatic memory extraction.
 
+## Fork integration boundary
+
+Upstream now distributes OpenViking through the external plugin catalog. This
+fork temporarily retains its bundled provider because it contains local
+current-authority recall, exact-match fallback and durable resource-task
+observation behavior not yet carried by that pinned external plugin. The
+upstream `plugins.memory.load_memory_provider` loader still supports bundled
+providers and gives this copy precedence; it implements the actual
+`MemoryProvider` interface, not a separate activation path.
+
+This source integration does not install or update any global plugin, start a
+server, or migrate a live home. Future extraction must port these behaviors and
+their regression tests into the external provider before removing this copy.
+In particular, an observer deadline is not cancellation of server ingestion:
+retain the durable task receipt for later observation. See
+`RESOURCE_OBSERVATION.md` for that contract. Provider worker targets capture the
+caller's profile context so background work does not inherit the launch home.
+
 ## Requirements
 
 - OpenViking installed with the `openviking-server` command available

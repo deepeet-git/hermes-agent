@@ -76,3 +76,14 @@ def test_apply_lean_chat_request_removes_tools_and_lowers_reasoning():
         "reasoning": {"effort": "low"},
         "other": True,
     }
+
+
+def test_conversational_suffix_cannot_hide_live_source_requirement():
+    for message in (
+        "현재 코드에서는 기존 경로를 계속 쓰나요? 어떻게 생각해?",
+        "DB 접근 가능한가요?",
+        "오늘 상태가 어때?",
+        "우리 로직은 어때?",
+        "디핏 콘솔 적용 과정은?",
+    ):
+        assert not should_use_lean_chat_fast_path(message)

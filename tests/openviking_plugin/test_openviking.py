@@ -159,8 +159,9 @@ class TestOpenVikingSkillQuerySafety:
 
         monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
         monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
-        monkeypatch.setattr(skill_commands, "_skill_commands", {})
-        monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+        monkeypatch.setattr(skill_commands, "_skill_commands_by_key", {})
+        monkeypatch.setattr(skill_commands, "_skill_commands_sig_by_key", {})
+        monkeypatch.setattr(skill_commands, "_last_interactive_skill_commands_by_key", {})
         monkeypatch.setattr(skill_bundles, "_bundles_cache", {})
         monkeypatch.setattr(skill_bundles, "_bundles_cache_mtime", None)
 

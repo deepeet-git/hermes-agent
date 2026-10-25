@@ -122,6 +122,11 @@ def _make_voice_receiver(secret_key, dave_session=None, bot_ssrc=9999,
     vc = MagicMock()
     vc._connection.secret_key = list(secret_key)
     vc._connection.dave_session = dave_session
+    # These legacy passthrough cases model an explicitly plaintext DAVE
+    # transport. Active-E2EE unknown-SSRC dropping has separate real coverage.
+    vc._connection.dave_protocol_version = 0
+    vc._connection.dave_downgraded = False
+    vc._connection.dave_pending_transitions = {}
     vc._connection.ssrc = bot_ssrc
     vc._connection.add_socket_listener = MagicMock()
     vc._connection.remove_socket_listener = MagicMock()
