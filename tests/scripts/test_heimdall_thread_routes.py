@@ -612,6 +612,13 @@ def test_real_config_loader_is_read_only(setup):
     assert {p: p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
 
 
+def test_get_opener_has_fixed_truthful_client_identification():
+    client = cli.GetOnly("synthetic-secret")
+    assert client._opener.addheaders == [
+        ("User-agent", "HeimdallThreadRoutes/1.0 (+https://github.com/deepeet-git/hermes-agent)")
+    ]
+
+
 def test_get_single_attempt_timeout_and_redirect_refusal(monkeypatch):
     from urllib.error import HTTPError
     import io
