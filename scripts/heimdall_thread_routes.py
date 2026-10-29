@@ -35,6 +35,7 @@ from utils import atomic_json_write
 CLAIM_SECONDS = 5.0
 HOLD_SECONDS = 8.0
 FRESH_SECONDS = 120.0
+USER_AGENT = "HeimdallThreadRoutes/1.0 (+https://github.com/deepeet-git/hermes-agent)"
 
 
 class Hold(Exception):
@@ -207,6 +208,7 @@ class GetOnly:
     def __init__(self, token):
         self._token = token
         self._opener = request.build_opener(NoRedirect())
+        self._opener.addheaders = [("User-agent", USER_AGENT)]
 
     def request(self, method, path):
         require(method == "GET", "HTTP method forbidden")
