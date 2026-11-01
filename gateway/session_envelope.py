@@ -10,6 +10,9 @@ from dataclasses import replace
 from datetime import datetime
 import json
 import logging
+import hashlib
+import hmac
+import secrets
 
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -166,7 +169,7 @@ def _validate_native(runner, event, provenance=None, fresh_roles=False):
 def snapshot_native(runner, event):
     from gateway.session_ingress_context import capture_provenance
     provenance = capture_provenance(runner, event)
-    return _snapshot_native(runner, _adapter_event(event), provenance)
+    return _snapshot_native(runner, _adapter_event(event), provenance, live_event=event)
 
 
 async def prepare_native(runner, event):
@@ -204,10 +207,11 @@ async def prepare_native(runner, event):
         except BaseException:
             await abandon_capture(scope)
             raise
-    return _snapshot_native(runner, frozen, provenance, fresh_roles, encoded_source, media)
+    return _snapshot_native(runner, frozen, provenance, fresh_roles, encoded_source, media, event)
 
 
-def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
+def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None,
+                     live_event=None):
     if encoded_source is None:
         encoded_source = _validate_native(runner, event, provenance, fresh_roles)
     envelope = {'source': encoded_source,
@@ -244,6 +248,18 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
     # Keep the private dispatch key so previously committed text-only rows recover
     # under the same authority; optional media/context fields extend that envelope.
     payload = {'text': event.text, 'native_text_v1': envelope}
+    if fingerprint := getattr(live_event or event, '_ingress_sha256', None):
+        # Admission attaches this pre-rewrite digest too; bind it before sealing.
+        envelope['ingress_sha256'] = fingerprint
+    if (event.source.platform.value == 'discord'
+            and getattr(event.source, '_trusted_heimdall_incident', False) is True):
+        # Only live adapter input may mint a grant; ordinary persisted provenance
+        # can restore a transport reference but cannot prove adapter validation.
+        from gateway.session_ingress_context import capture_provenance
+        if provenance is None or capture_provenance(runner, live_event or event) != provenance:
+            raise RuntimeStoreError('permission_denied')
+        key = runner.__dict__.setdefault('_heimdall_native_key', secrets.token_bytes(32))
+        envelope['heimdall_seal'] = _heimdall_seal(key, payload)
     # Only an exact persisted legacy retry retains its old fingerprint. New
     # ordinary admissions must bind homes too, including execution after restart.
     if provenance is not None and not getattr(runner.config, 'multiplex_profiles', False):
@@ -260,10 +276,30 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
     return payload
 
 
+def _heimdall_seal(key, payload):
+    body = deepcopy(payload)
+    body['native_text_v1'].pop('heimdall_seal', None)
+    return hmac.new(key, json.dumps(body, sort_keys=True, separators=(',', ':'),
+                                   allow_nan=False).encode(), hashlib.sha256).hexdigest()
+
+
 def restore_native_source(payload, runner=None):
     """restore_native's source (provenance included) without re-verifying the captured media:
     admission needs only the route; execution's restore_native still checks every byte."""
     envelope = payload['native_text_v1']
+    if runner is None:
+        from gateway.session_ingress_context import callback_runner
+        runner = callback_runner()
+    trusted = False
+    if '_trusted_heimdall_incident' in envelope['source']:
+        raise RuntimeStoreError('permission_denied')
+    if 'heimdall_seal' in envelope:
+        key = runner.__dict__.get('_heimdall_native_key') if runner is not None else None
+        seal = envelope['heimdall_seal']
+        if (key is None or not isinstance(seal, str)
+                or not hmac.compare_digest(seal, _heimdall_seal(key, payload))):
+            raise RuntimeStoreError('permission_denied')
+        trusted = True
     source = SessionSource.from_dict(envelope['source'])
     source.is_bot = envelope['source']['is_bot']
     # Private descriptor requests a fresh check, never supplies the verdict.
@@ -273,6 +309,8 @@ def restore_native_source(payload, runner=None):
         runner = runner or callback_runner()
         if runner is not None:
             restore_provenance(runner, source, envelope['provenance'])
+    if trusted:
+        source._trusted_heimdall_incident = True
     return source
 
 
