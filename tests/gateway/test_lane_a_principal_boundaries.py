@@ -5,6 +5,8 @@ import pytest
 
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.config import Platform, PlatformConfig
+# Bootstrap runtime dependencies during collection, before home-I/O isolation.
+from gateway.run import _principal_context_is_restricted
 from gateway.session import SessionSource
 
 
@@ -43,8 +45,6 @@ def source(user="owner-a", chat="internal", **kwargs):
 
 @pytest.mark.parametrize("owner", ["owner-a", "owner-b"])
 def test_both_owners_inherit_internal_read_tools_and_private_context(owner):
-    from gateway.run import _principal_context_is_restricted
-
     configured = policy()
     runner = BoundaryRunner(configured)
     current = source(owner)
@@ -64,8 +64,6 @@ def test_legacy_chat_grant_cannot_bypass_configured_channel_policy(configured):
 
 
 def test_scoped_principal_does_not_gain_private_context_by_listing_all_tools():
-    from gateway.run import _principal_context_is_restricted
-
     configured = policy()
     tools = ["terminal"]
     assert BoundaryRunner(configured)._principal_effective_toolsets(source("regular"), tools) == tools
