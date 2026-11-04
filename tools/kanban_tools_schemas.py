@@ -176,7 +176,9 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "block on things you can resolve yourself. Expected idle-drain, time, "
+        "or incoming-event waits are not transient failures: use kanban_schedule "
+        "with a concrete wake condition and an orchestrator-owned wake mechanism."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -205,7 +207,12 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
         "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
         "task non-dispatchable until an orchestrator unblocks it; it does not "
         "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``. Use this for expected "
+        "idle-drain or genuine incoming-event waits, not kanban_block. These "
+        "waits do not count toward block-loop escalation or emit blocked alerts. "
+        "Record the wake condition and resumption owner; the orchestrator must "
+        "arrange the actual timer or event observer. It can also recover a "
+        "triage card whose normal wait was misclassified without erasing history."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
