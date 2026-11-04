@@ -107,6 +107,17 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append("## Body")
         lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+    lines.append("## Waiting versus failure")
+    lines.append(
+        "Expected idle-drain, time, or genuine incoming-event waits use "
+        "kanban_schedule, not kanban_block(kind='transient'). Record a concrete "
+        "wake condition and who owns resumption. Scheduling is not a timer: "
+        "arrange an actual timer/event observer with the orchestrator; do not "
+        "claim automatic resumption without one. Keep completed evidence and "
+        "the same card. Use kanban_block only for genuine failures, missing "
+        "capability, human input, or an actual incomplete parent dependency."
+    )
+    lines.append("")
 
 
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:

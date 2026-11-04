@@ -3869,8 +3869,12 @@ def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    """Park in ``scheduled`` until an orchestrator unblocks the task.
+
+    Explicit scheduling also recovers a triage card whose expected wait was
+    misclassified as failure. Preserve its failure counters and audit history;
+    a stale worker still cannot change a card owned by another run.
+    """
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -3880,7 +3884,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"

@@ -1187,7 +1187,19 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
-def test_create_tui_subscription_binds_to_live_session_after_compaction_fork(monkeypatch, worker_env, tmp_path):
+@pytest.fixture
+def isolated_lazy_bootstrap(monkeypatch):
+    # Session lineage tests already run in the canonical test environment.
+    # A lazy bootstrap import must not recover/update the real source install.
+    monkeypatch.setattr("hermes_cli._early_recovery.restore_interrupted_pull", lambda root: False)
+    monkeypatch.setattr("hermes_cli.venv_sync.prepare_launch", lambda root, argv: None)
+    monkeypatch.setattr("hermes_cli._early_recovery.recover_if_needed", lambda root: None)
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda root: None)
+
+
+def test_create_tui_subscription_binds_to_live_session_after_compaction_fork(
+    monkeypatch, worker_env, tmp_path, isolated_lazy_bootstrap,
+):
     """#110068: the inherited HERMES_SESSION_KEY can name a session already superseded
     by a compaction fork. Auto-subscribe must bind to the live continuation tip resolved
     from the session store, not the stale key the process was launched with."""
@@ -1224,7 +1236,7 @@ def test_create_tui_subscription_binds_to_live_session_after_compaction_fork(mon
     assert subs[0]["chat_id"] == live
 
 
-def test_live_tui_session_key_uses_profile_store(monkeypatch, tmp_path):
+def test_live_tui_session_key_uses_profile_store(monkeypatch, tmp_path, isolated_lazy_bootstrap):
     """A named-profile session's lineage lives in profiles/<x>/state.db, not the default
     store: resolution must open THAT store."""
     from hermes_cli import profiles as profiles_mod
