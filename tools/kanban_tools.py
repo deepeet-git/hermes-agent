@@ -1248,6 +1248,17 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
                for sub in _kbn.list_notify_subs(conn, task_id)):
             return True
+        if target["platform"] != "tui":
+            # Defaults/LKG fallback on a broken file could turn wake-only into outward uploads.
+            from hermes_cli.config_effective import load_user_config_effective
+            config = load_user_config_effective(fail_closed=True)
+            if not isinstance(config.get("kanban", {}), dict):
+                raise ValueError("cannot auto-subscribe with malformed kanban config")
+            mode = cfg_get(config, "kanban", "auto_subscribe_delivery_mode",
+                           default="notify+wake")
+            if not isinstance(mode, str) or mode not in {"notify", "notify+wake", "wake"}:
+                raise ValueError("kanban.auto_subscribe_delivery_mode must be notify, notify+wake or wake")
+            target["delivery_mode"] = mode
         _kbn.add_notify_sub(conn, task_id=task_id, **target)
         return True
     except Exception as _exc:

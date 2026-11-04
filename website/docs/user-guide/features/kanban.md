@@ -831,7 +831,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = the root task keeps its own assignee, else the active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to the root task's assignee, else the active default. |
-| `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
+| `auto_subscribe_on_create` | `true` | Auto-subscribe a persistent gateway/TUI session when the `kanban_create` tool creates a task. Set to `false` to require explicit subscriptions. Independent of `auto_decompose`. |
+| `auto_subscribe_delivery_mode` | `notify+wake` | New tool-created chat subscriptions: `notify`, `notify+wake`, or `wake`. Profile-local; does not override manual/inherited subscriptions or TUI behavior. `wake` skips passive pings and uploads but preserves agent continuation. |
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 
@@ -1131,7 +1132,17 @@ Built-in decomposition also inherits its root's durable session. Session lineage
 `session_id` does not replace existing subscriptions; use `notify-subscribe` and
 `notify-unsubscribe` to change where events are delivered.
 
-A chat-originated auto-subscribe is created in `notify+wake` mode: on a terminal event the destination agent both receives the passive message **and** takes a real turn, so it can read the board context and reply in its own voice. See [Delivery modes](#delivery-modes) below.
+A chat-originated tool auto-subscribe defaults to `notify+wake`: on a terminal event the destination agent both receives the passive message **and** takes a real turn. Set the profile-local `kanban.auto_subscribe_delivery_mode` to `notify`, `notify+wake`, or `wake` to choose the policy for **new** `kanban_create` tool subscriptions. TUI behavior, manual subscriptions, and inherited subscriptions are unchanged; this does not globally mute notifications or change `/kanban create` slash-command policy.
+
+For internal development work where only the originating agent should continue, the operator can activate wake-only in the owning profile:
+
+```bash
+hermes config set kanban.auto_subscribe_delivery_mode wake
+hermes config get kanban.auto_subscribe_delivery_mode
+# Named profile instead: hermes -p <profile> config set kanban.auto_subscribe_delivery_mode wake
+```
+
+The setting is read at tool subscription creation; it does not rewrite existing rows. Roll back the default with `hermes config set kanban.auto_subscribe_delivery_mode notify+wake`. Invalid values log a warning and return `subscribed=false` without creating a new subscription (task creation still succeeds); fix the setting and explicitly subscribe the affected task rather than assuming delivery. A `wake` subscription skips passive text **and artifact uploads**, but retains board events, stored deliverables, wake admission/retries, and cursor progress. Keep an explicit `notify`/`notify+wake` subscription for requested report uploads, or have the agent deliver the requested report separately. See [Delivery modes](#delivery-modes).
 
 ### Output truncation in messaging
 
