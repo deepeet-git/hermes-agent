@@ -1,3 +1,6 @@
+# Bootstrap the real gateway importer before per-test home I/O guards activate.
+import hermes_bootstrap
+
 import asyncio
 import pytest
 
