@@ -7,8 +7,11 @@ import weakref
 import hashlib
 import hmac
 import json
+import logging
 
 from hermes_state_runtime import RuntimeStoreError
+
+logger = logging.getLogger(__name__)
 
 _callback: ContextVar[tuple | None] = ContextVar('native_ingress_callback', default=None)
 _relay_callback: ContextVar[tuple | None] = ContextVar('relay_ingress_callback', default=None)
@@ -221,7 +224,28 @@ def restore_provenance(runner, source, provenance):
     source.delivered_via_upstream_relay = candidate.delivered_via_upstream_relay
     source._transport_adapter_ref = weakref.ref(adapter)
     source._authorization_profile_home = home
+    _restore_verified_discord_parent(adapter, source)
     return runtime_home
+
+
+def _restore_verified_discord_parent(adapter, source):
+    """Mint thread-parent proof only from the current receiving Discord adapter."""
+    source.__dict__.pop('_validated_parent_chat_id', None)
+    from gateway.config import Platform
+    if (source.platform != Platform.DISCORD or source.delivered_via_upstream_relay
+            or getattr(adapter, 'platform', None) != Platform.DISCORD
+            or source.chat_type != 'thread' or not source.thread_id or not source.parent_chat_id):
+        return
+    verifier = getattr(adapter, 'verified_parent_chat_id', None)
+    if not callable(verifier):
+        return
+    try:
+        parent = verifier(source)
+    except Exception:
+        logger.warning('Discord thread parent revalidation unavailable', exc_info=True)
+        return
+    if parent is not None and str(parent) == str(source.parent_chat_id):
+        source._validated_parent_chat_id = str(parent)
 
 
 async def reauthorize_roles(runner, source, provenance):

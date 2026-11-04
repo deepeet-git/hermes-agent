@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+# Bootstrap runtime dependencies during collection, before home-I/O isolation.
+from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
@@ -12,8 +14,6 @@ class AdapterFake(SimpleNamespace):
 
 
 def _runner(policy, *, verified_parent=False):
-    from gateway.run import GatewayRunner
-
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={
@@ -71,7 +71,7 @@ def test_trusted_heimdall_intake_is_not_erased_by_generic_principal_toolsets():
         scope_id="guild-1",
         is_bot=True,
     )
-    setattr(source, "_trusted_heimdall_incident", True)
+    source._trusted_heimdall_incident = True
 
     platform_toolsets = ["terminal", "file", "delegation", "web"]
     effective = _runner(_policy())._principal_effective_toolsets(
@@ -154,17 +154,13 @@ def test_adapter_history_auth_rebuilds_verified_discord_thread_context(monkeypat
     _clear_auth_env(monkeypatch)
     runner = _runner(_policy(), verified_parent=True)
     adapter = runner.adapters[Platform.DISCORD]
-    setattr(
-        adapter,
-        "authorization_context_for_chat",
-        lambda chat_id: {
-            "chat_id": chat_id,
-            "chat_type": "thread",
-            "thread_id": chat_id,
-            "parent_chat_id": "pdp-channel",
-            "scope_id": "guild-1",
-        },
-    )
+    adapter.authorization_context_for_chat = lambda chat_id: {
+        "chat_id": chat_id,
+        "chat_type": "thread",
+        "thread_id": chat_id,
+        "parent_chat_id": "pdp-channel",
+        "scope_id": "guild-1",
+    }
 
     check = runner._make_adapter_auth_check(Platform.DISCORD)
 
